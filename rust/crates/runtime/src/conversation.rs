@@ -92,10 +92,10 @@ pub trait ApiClient {
     fn stream_observed(
         &mut self,
         request: ApiRequest,
-        mut observer: Option<&mut RuntimeStreamObserver<'_>>,
+        observer: Option<&mut RuntimeStreamObserver<'_>>,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let events = self.stream(request)?;
-        if let Some(observer) = observer.as_deref_mut() {
+        if let Some(observer) = observer {
             for event in &events {
                 observer(RuntimeStreamEvent::Assistant(event.clone()));
             }
