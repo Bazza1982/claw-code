@@ -43,6 +43,38 @@ pub enum AssistantEvent {
     MessageStop,
 }
 
+/// Observable runtime progress emitted while processing an assistant turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeStreamEvent {
+    Assistant(AssistantEvent),
+    /// The provider exposed only aggregate/redacted reasoning progress.
+    ThinkingProgress {
+        chars: Option<usize>,
+        redacted: bool,
+    },
+    /// A provider reasoning fragment safe to expose to HASHI telemetry.
+    ThinkingDelta {
+        text: String,
+        source: String,
+        visibility: String,
+    },
+    ToolStart {
+        iteration: usize,
+        id: String,
+        name: String,
+        input: String,
+    },
+    ToolEnd {
+        iteration: usize,
+        id: String,
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+}
+
+pub type RuntimeStreamObserver<'a> = dyn FnMut(RuntimeStreamEvent) + 'a;
+
 /// Prompt-cache telemetry captured from the provider response stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptCacheEvent {
@@ -56,6 +88,20 @@ pub struct PromptCacheEvent {
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+
+    fn stream_observed(
+        &mut self,
+        request: ApiRequest,
+        mut observer: Option<&mut RuntimeStreamObserver<'_>>,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let events = self.stream(request)?;
+        if let Some(observer) = observer.as_deref_mut() {
+            for event in &events {
+                observer(RuntimeStreamEvent::Assistant(event.clone()));
+            }
+        }
+        Ok(events)
+    }
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -325,7 +371,17 @@ where
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.run_turn_observed(user_input, prompter, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn run_turn_observed(
+        &mut self,
+        user_input: impl Into<String>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
+        mut observer: Option<&mut RuntimeStreamObserver<'_>>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
 
@@ -365,7 +421,10 @@ where
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
             };
-            let events = match self.api_client.stream(request) {
+            let events = match self
+                .api_client
+                .stream_observed(request, observer.as_deref_mut())
+            {
                 Ok(events) => events,
                 Err(error) => {
                     self.record_turn_failed(iterations, &error);
@@ -416,6 +475,14 @@ where
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                if let Some(observer) = observer.as_deref_mut() {
+                    observer(RuntimeStreamEvent::ToolStart {
+                        iteration: iterations,
+                        id: tool_use_id.clone(),
+                        name: tool_name.clone(),
+                        input: input.clone(),
+                    });
+                }
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -513,6 +580,23 @@ where
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
+                if let Some(observer) = observer.as_deref_mut() {
+                    if let Some(ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        output,
+                        is_error,
+                    }) = result_message.blocks.first()
+                    {
+                        observer(RuntimeStreamEvent::ToolEnd {
+                            iteration: iterations,
+                            id: tool_use_id.clone(),
+                            name: tool_name.clone(),
+                            output: output.clone(),
+                            is_error: *is_error,
+                        });
+                    }
+                }
                 tool_results.push(result_message);
             }
         }
@@ -850,7 +934,8 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        RuntimeStreamEvent, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -967,8 +1052,14 @@ mod tests {
             system_prompt,
         );
 
+        let mut observed = Vec::new();
+        let mut observer = |event| observed.push(event);
         let summary = runtime
-            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .run_turn_observed(
+                "what is 2 + 2?",
+                Some(&mut PromptAllowOnce),
+                Some(&mut observer),
+            )
             .expect("conversation loop should succeed");
 
         assert_eq!(summary.iterations, 2);
@@ -989,6 +1080,24 @@ mod tests {
                 ..
             }
         ));
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::Assistant(AssistantEvent::TextDelta(text))
+                if text == "Let me calculate that."
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::ToolStart { name, .. } if name == "add"
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::ToolEnd {
+                name,
+                output,
+                is_error: false,
+                ..
+            } if name == "add" && output == "4"
+        )));
     }
 
     #[test]

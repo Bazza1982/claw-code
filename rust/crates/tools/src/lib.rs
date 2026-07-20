@@ -30,7 +30,7 @@ use runtime::{
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
     LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
     PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
-    Session, TaskPacket, ToolError, ToolExecutor,
+    RuntimeStreamEvent, RuntimeStreamObserver, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -5181,6 +5181,14 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
 
 impl ApiClient for ProviderRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.stream_observed(request, None)
+    }
+
+    fn stream_observed(
+        &mut self,
+        request: ApiRequest,
+        mut observer: Option<&mut RuntimeStreamObserver<'_>>,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
             .map(|spec| ToolDefinition {
@@ -5209,7 +5217,11 @@ impl ApiClient for ProviderRuntimeClient {
                 ..Default::default()
             };
 
-            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            let attempt = runtime.block_on(stream_with_provider(
+                &entry.client,
+                &message_request,
+                observer.as_deref_mut(),
+            ));
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
@@ -5234,6 +5246,7 @@ impl ApiClient for ProviderRuntimeClient {
 async fn stream_with_provider(
     client: &ProviderClient,
     message_request: &MessageRequest,
+    mut observer: Option<&mut RuntimeStreamObserver<'_>>,
 ) -> Result<Vec<AssistantEvent>, ApiError> {
     let mut stream = client.stream_message(message_request).await?;
     let mut events = Vec::new();
@@ -5268,7 +5281,11 @@ async fn stream_with_provider(
             ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                 ContentBlockDelta::TextDelta { text } => {
                     if !text.is_empty() {
-                        events.push(AssistantEvent::TextDelta(text));
+                        push_observed_event(
+                            &mut events,
+                            AssistantEvent::TextDelta(text),
+                            &mut observer,
+                        );
                     }
                 }
                 ContentBlockDelta::InputJsonDelta { partial_json } => {
@@ -5276,9 +5293,23 @@ async fn stream_with_provider(
                         input.push_str(&partial_json);
                     }
                 }
-                ContentBlockDelta::ThinkingDelta { thinking } => {
-                    if let Some((pending, _)) = pending_thinking.get_mut(&delta.index) {
-                        pending.push_str(&thinking);
+                ContentBlockDelta::ThinkingDelta {
+                    thinking,
+                    source,
+                    visibility,
+                } => {
+                    let visibility = visibility.unwrap_or_else(|| "provider_returned".to_string());
+                    if visibility != "provider_redacted" {
+                        if let Some((pending, _)) = pending_thinking.get_mut(&delta.index) {
+                            pending.push_str(&thinking);
+                        }
+                    }
+                    if let Some(observer) = observer.as_deref_mut() {
+                        observer(RuntimeStreamEvent::ThinkingDelta {
+                            text: thinking,
+                            source: source.unwrap_or_else(|| "provider.thinking".to_string()),
+                            visibility,
+                        });
                     }
                 }
                 ContentBlockDelta::SignatureDelta { signature } => {
@@ -5291,21 +5322,31 @@ async fn stream_with_provider(
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if let Some((thinking, signature)) = pending_thinking.remove(&stop.index) {
-                    events.push(AssistantEvent::Thinking {
-                        thinking,
-                        signature,
-                    });
+                    if !thinking.is_empty() || signature.is_some() {
+                        events.push(AssistantEvent::Thinking {
+                            thinking,
+                            signature,
+                        });
+                    }
                 }
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                    events.push(AssistantEvent::ToolUse { id, name, input });
+                    push_observed_event(
+                        &mut events,
+                        AssistantEvent::ToolUse { id, name, input },
+                        &mut observer,
+                    );
                 }
             }
             ApiStreamEvent::MessageDelta(delta) => {
-                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                push_observed_event(
+                    &mut events,
+                    AssistantEvent::Usage(delta.usage.token_usage()),
+                    &mut observer,
+                );
             }
             ApiStreamEvent::MessageStop(_) => {
                 saw_stop = true;
-                events.push(AssistantEvent::MessageStop);
+                push_observed_event(&mut events, AssistantEvent::MessageStop, &mut observer);
             }
         }
     }
@@ -5335,8 +5376,24 @@ async fn stream_with_provider(
         })
         .await?;
     let mut events = response_to_events(response);
+    if let Some(observer) = observer.as_deref_mut() {
+        for event in &events {
+            observer(RuntimeStreamEvent::Assistant(event.clone()));
+        }
+    }
     push_prompt_cache_record(client, &mut events);
     Ok(events)
+}
+
+fn push_observed_event(
+    events: &mut Vec<AssistantEvent>,
+    event: AssistantEvent,
+    observer: &mut Option<&mut RuntimeStreamObserver<'_>>,
+) {
+    if let Some(observer) = observer.as_deref_mut() {
+        observer(RuntimeStreamEvent::Assistant(event.clone()));
+    }
+    events.push(event);
 }
 
 struct SubagentToolExecutor {

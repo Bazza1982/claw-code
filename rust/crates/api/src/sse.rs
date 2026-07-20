@@ -287,6 +287,8 @@ mod tests {
                     index: 0,
                     delta: ContentBlockDelta::ThinkingDelta {
                         thinking: "step 1".to_string(),
+                        source: None,
+                        visibility: None,
                     },
                 }
             ))

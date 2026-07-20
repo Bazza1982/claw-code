@@ -61,7 +61,8 @@ use runtime::{
     ConversationMessage, ConversationRuntime, McpConfigCollection, McpInvalidServerConfig,
     McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
     PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    RuntimeInvalidHookConfig, RuntimeStreamEvent, RuntimeStreamObserver, Session, TokenUsage,
+    ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -674,7 +675,9 @@ fn fallback_hint_for_error_kind(kind: &str) -> Option<&'static str> {
         "invalid_tool_name" => Some(
             "Use canonical snake_case tool names from `available` or documented aliases from `tool_aliases`.",
         ),
-        "invalid_output_format" => Some("Use --output-format text or --output-format json."),
+        "invalid_output_format" => Some(
+            "Use --output-format text, --output-format json, or --output-format stream-json.",
+        ),
         _ => None,
     }
 }
@@ -1083,7 +1086,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let resolved_model = resolve_repl_model(model)?;
             let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+            let stream_json = current_output_format_selection()
+                .raw
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("stream-json"));
+            cli.run_turn_with_output(&effective_prompt, output_format, compact, stream_json)?;
         }
         CliAction::Doctor {
             output_format,
@@ -1460,9 +1467,14 @@ impl CliOutputFormat {
     fn parse(value: &str) -> Result<Self, String> {
         match value.trim() {
             value if value.eq_ignore_ascii_case("text") => Ok(Self::Text),
-            value if value.eq_ignore_ascii_case("json") => Ok(Self::Json),
+            value
+                if value.eq_ignore_ascii_case("json")
+                    || value.eq_ignore_ascii_case("stream-json") =>
+            {
+                Ok(Self::Json)
+            }
             other => Err(format!(
-                "invalid_output_format: unsupported value for --output-format: {other}\nExpected: text, json\nHint: Use --output-format text or --output-format json."
+                "invalid_output_format: unsupported value for --output-format: {other}\nExpected: text, json, stream-json\nHint: Use --output-format text, --output-format json, or --output-format stream-json."
             )),
         }
     }
@@ -7975,9 +7987,11 @@ impl LiveCli {
         input: &str,
         output_format: CliOutputFormat,
         compact: bool,
+        stream_json: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match output_format {
             CliOutputFormat::Json if compact => self.run_prompt_compact_json(input),
+            CliOutputFormat::Json if stream_json => self.run_prompt_stream_json(input),
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
@@ -8057,6 +8071,60 @@ impl LiveCli {
                 )
             })
         );
+        Ok(())
+    }
+
+    fn run_prompt_stream_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        println!(
+            "{}",
+            json!({
+                "kind": "run_started",
+                "model": self.model,
+            })
+        );
+        io::stdout().flush()?;
+
+        let mut observer = |event: RuntimeStreamEvent| {
+            println!("{}", runtime_stream_event_json(event));
+            let _ = io::stdout().flush();
+        };
+        let result =
+            runtime.run_turn_observed(input, Some(&mut permission_prompter), Some(&mut observer));
+        hook_abort_monitor.stop();
+        let summary = result?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+        println!(
+            "{}",
+            json!({
+                "kind": "run_finished",
+                "message": final_assistant_text(&summary),
+                "model": self.model,
+                "iterations": summary.iterations,
+                "auto_compaction": summary.auto_compaction.map(|event| json!({
+                    "removed_messages": event.removed_message_count,
+                    "notice": format_auto_compaction_notice(event.removed_message_count),
+                })),
+                "tool_uses": collect_tool_uses(&summary),
+                "tool_results": collect_tool_results(&summary),
+                "prompt_cache_events": collect_prompt_cache_events(&summary),
+                "usage": {
+                    "input_tokens": summary.usage.input_tokens,
+                    "output_tokens": summary.usage.output_tokens,
+                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                },
+                "estimated_cost": format_usd(
+                    summary.usage.estimate_cost_usd_with_pricing(
+                        pricing_for_model(&self.model)
+                            .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
+                    ).total_cost_usd()
+                )
+            })
+        );
+        io::stdout().flush()?;
         Ok(())
     }
 
@@ -12625,8 +12693,26 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
 }
 
 impl ApiClient for AnthropicRuntimeClient {
-    #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.stream_with_observer(request, None)
+    }
+
+    fn stream_observed(
+        &mut self,
+        request: ApiRequest,
+        observer: Option<&mut RuntimeStreamObserver<'_>>,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        self.stream_with_observer(request, observer)
+    }
+}
+
+impl AnthropicRuntimeClient {
+    #[allow(clippy::too_many_lines)]
+    fn stream_with_observer(
+        &mut self,
+        request: ApiRequest,
+        mut observer: Option<&mut RuntimeStreamObserver<'_>>,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
@@ -12654,7 +12740,11 @@ impl ApiClient for AnthropicRuntimeClient {
 
             for attempt in 1..=max_attempts {
                 let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
+                    .consume_stream(
+                        &message_request,
+                        is_post_tool && attempt == 1,
+                        observer.as_deref_mut(),
+                    )
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
@@ -12672,9 +12762,6 @@ impl ApiClient for AnthropicRuntimeClient {
             Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         })
     }
-}
-
-impl AnthropicRuntimeClient {
     /// Consume a single streaming response, optionally applying a stall
     /// timeout on the first event for post-tool continuations.
     #[allow(clippy::too_many_lines)]
@@ -12682,6 +12769,7 @@ impl AnthropicRuntimeClient {
         &self,
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
+        mut observer: Option<&mut RuntimeStreamObserver<'_>>,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let mut stream = self
             .client
@@ -12744,13 +12832,31 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::ContentBlockStart(start) => {
-                    // 特判 Thinking 块：初始化 pending_thinking（用于累积后续 ThinkingDelta）
-                    if let OutputContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } = &start.content_block
-                    {
-                        pending_thinking = Some((thinking.clone(), signature.clone()));
+                    match &start.content_block {
+                        OutputContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        } => {
+                            pending_thinking = Some((thinking.clone(), signature.clone()));
+                            if !thinking.is_empty() {
+                                if let Some(observer) = observer.as_deref_mut() {
+                                    observer(RuntimeStreamEvent::ThinkingDelta {
+                                        text: thinking.clone(),
+                                        source: "assistant_thinking".to_string(),
+                                        visibility: "provider_returned".to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        OutputContentBlock::RedactedThinking { .. } => {
+                            if let Some(observer) = observer.as_deref_mut() {
+                                observer(RuntimeStreamEvent::ThinkingProgress {
+                                    chars: None,
+                                    redacted: true,
+                                });
+                            }
+                        }
+                        _ => {}
                     }
                     push_output_block(
                         start.content_block,
@@ -12772,7 +12878,11 @@ impl AnthropicRuntimeClient {
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                             }
-                            events.push(AssistantEvent::TextDelta(text));
+                            let event = AssistantEvent::TextDelta(text);
+                            if let Some(observer) = observer.as_deref_mut() {
+                                observer(RuntimeStreamEvent::Assistant(event.clone()));
+                            }
+                            events.push(event);
                         }
                     }
                     ContentBlockDelta::InputJsonDelta { partial_json } => {
@@ -12780,14 +12890,28 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { thinking } => {
+                    ContentBlockDelta::ThinkingDelta {
+                        thinking,
+                        source,
+                        visibility,
+                    } => {
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
                         }
-                        // 累积 thinking 文本到 pending_thinking（让 session 持久化能拿到）
-                        if let Some((t, _)) = &mut pending_thinking {
-                            t.push_str(&thinking);
+                        let visibility =
+                            visibility.unwrap_or_else(|| "provider_returned".to_string());
+                        if visibility != "provider_redacted" {
+                            if let Some((accumulated, _)) = &mut pending_thinking {
+                                accumulated.push_str(&thinking);
+                            }
+                        }
+                        if let Some(observer) = observer.as_deref_mut() {
+                            observer(RuntimeStreamEvent::ThinkingDelta {
+                                text: thinking,
+                                source: source.unwrap_or_else(|| "provider.thinking".to_string()),
+                                visibility,
+                            });
                         }
                     }
                     ContentBlockDelta::SignatureDelta { signature } => {
@@ -12806,10 +12930,12 @@ impl AnthropicRuntimeClient {
                     }
                     // 把累积的 thinking 转成 AssistantEvent::Thinking（让 build_assistant_message 写入 session）
                     if let Some((thinking, signature)) = pending_thinking.take() {
-                        events.push(AssistantEvent::Thinking {
-                            thinking,
-                            signature,
-                        });
+                        if !thinking.is_empty() || signature.is_some() {
+                            events.push(AssistantEvent::Thinking {
+                                thinking,
+                                signature,
+                            });
+                        }
                     }
                     if let Some((id, name, input)) = pending_tool.take() {
                         if let Some(progress_reporter) = &self.progress_reporter {
@@ -12819,11 +12945,19 @@ impl AnthropicRuntimeClient {
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        events.push(AssistantEvent::ToolUse { id, name, input });
+                        let event = AssistantEvent::ToolUse { id, name, input };
+                        if let Some(observer) = observer.as_deref_mut() {
+                            observer(RuntimeStreamEvent::Assistant(event.clone()));
+                        }
+                        events.push(event);
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
-                    events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    let event = AssistantEvent::Usage(delta.usage.token_usage());
+                    if let Some(observer) = observer.as_deref_mut() {
+                        observer(RuntimeStreamEvent::Assistant(event.clone()));
+                    }
+                    events.push(event);
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
@@ -12832,12 +12966,22 @@ impl AnthropicRuntimeClient {
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
-                    events.push(AssistantEvent::MessageStop);
+                    let event = AssistantEvent::MessageStop;
+                    if let Some(observer) = observer.as_deref_mut() {
+                        observer(RuntimeStreamEvent::Assistant(event.clone()));
+                    }
+                    events.push(event);
                 }
             }
         }
 
+        let observed_len = events.len();
         push_prompt_cache_record(&self.client, &mut events);
+        if let Some(observer) = observer.as_deref_mut() {
+            for event in &events[observed_len..] {
+                observer(RuntimeStreamEvent::Assistant(event.clone()));
+            }
+        }
 
         if !saw_stop
             && events.iter().any(|event| {
@@ -12845,7 +12989,11 @@ impl AnthropicRuntimeClient {
                     || matches!(event, AssistantEvent::ToolUse { .. })
             })
         {
-            events.push(AssistantEvent::MessageStop);
+            let event = AssistantEvent::MessageStop;
+            if let Some(observer) = observer.as_deref_mut() {
+                observer(RuntimeStreamEvent::Assistant(event.clone()));
+            }
+            events.push(event);
         }
 
         if events
@@ -12867,6 +13015,11 @@ impl AnthropicRuntimeClient {
             })?;
         let mut events = response_to_events(response, out)?;
         push_prompt_cache_record(&self.client, &mut events);
+        if let Some(observer) = observer.as_deref_mut() {
+            for event in &events {
+                observer(RuntimeStreamEvent::Assistant(event.clone()));
+            }
+        }
         Ok(events)
     }
 }
@@ -13045,6 +13198,123 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+fn runtime_stream_event_json(event: RuntimeStreamEvent) -> serde_json::Value {
+    match event {
+        RuntimeStreamEvent::Assistant(AssistantEvent::Thinking {
+            thinking,
+            signature,
+        }) => json!({
+            "kind": "thinking_delta",
+            "text": thinking,
+            "summary": "thinking block received",
+            "thinking_chars": thinking.chars().count(),
+            "reasoning_source": "assistant_thinking",
+            "visibility": "provider_returned",
+            "has_signature": signature.is_some(),
+        }),
+        RuntimeStreamEvent::Assistant(AssistantEvent::TextDelta(text)) => json!({
+            "kind": "assistant_delta",
+            "text": text,
+        }),
+        RuntimeStreamEvent::Assistant(AssistantEvent::ToolUse { id, name, input }) => json!({
+            "kind": "tool_call",
+            "id": id,
+            "name": name,
+            "input": input,
+            "summary": describe_tool_progress(&name, &input),
+        }),
+        RuntimeStreamEvent::Assistant(AssistantEvent::Usage(usage)) => json!({
+            "kind": "usage",
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+            "thinking_token_source": "unavailable",
+        }),
+        RuntimeStreamEvent::Assistant(AssistantEvent::PromptCache(event)) => json!({
+            "kind": "prompt_cache",
+            "unexpected": event.unexpected,
+            "reason": event.reason,
+            "previous_cache_read_input_tokens": event.previous_cache_read_input_tokens,
+            "current_cache_read_input_tokens": event.current_cache_read_input_tokens,
+            "token_drop": event.token_drop,
+        }),
+        RuntimeStreamEvent::Assistant(AssistantEvent::MessageStop) => json!({
+            "kind": "message_stop",
+        }),
+        RuntimeStreamEvent::ThinkingProgress { chars, redacted } => json!({
+            "kind": "thinking_summary",
+            "summary": if redacted {
+                "provider emitted redacted reasoning block".to_string()
+            } else if let Some(chars) = chars {
+                format!("provider reasoning block received ({chars} chars hidden)")
+            } else {
+                "provider reasoning stream active (content hidden)".to_string()
+            },
+            "thinking_chars": chars.unwrap_or(0),
+            "redacted": redacted,
+        }),
+        RuntimeStreamEvent::ThinkingDelta {
+            text,
+            source,
+            visibility,
+        } => {
+            let chars = text.chars().count();
+            if visibility == "provider_redacted" {
+                json!({
+                    "kind": "thinking_redacted",
+                    "summary": text,
+                    "thinking_chars": chars,
+                    "reasoning_source": source,
+                    "visibility": visibility,
+                })
+            } else {
+                json!({
+                    "kind": "thinking_delta",
+                    "text": text,
+                    "summary": "provider reasoning block received",
+                    "thinking_chars": chars,
+                    "reasoning_source": source,
+                    "visibility": visibility,
+                })
+            }
+        }
+        RuntimeStreamEvent::ToolStart {
+            iteration,
+            id,
+            name,
+            input,
+        } => json!({
+            "kind": "tool_start",
+            "iteration": iteration,
+            "id": id,
+            "name": name,
+            "input": input,
+            "summary": describe_tool_progress(&name, &input),
+        }),
+        RuntimeStreamEvent::ToolEnd {
+            iteration,
+            id,
+            name,
+            output,
+            is_error,
+        } => json!({
+            "kind": "tool_end",
+            "iteration": iteration,
+            "id": id,
+            "name": name,
+            "is_error": is_error,
+            "output_preview": truncate_for_summary(&output, 500),
+            "output_chars": output.chars().count(),
+            "summary": if is_error {
+                format!("{name} failed")
+            } else {
+                format!("{name} completed")
+            },
+        }),
+    }
 }
 
 fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
@@ -14063,7 +14333,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt [--stdin] [TEXT]"
+        "  claw [--model MODEL] [--output-format text|json|stream-json] prompt [--stdin] [TEXT]"
     )?;
     writeln!(
         out,
@@ -14071,7 +14341,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
+        "  claw [--model MODEL] [--output-format text|json|stream-json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
@@ -14135,7 +14405,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --output-format FORMAT     Non-interactive output format: text or json (case-insensitive)"
+        "  --output-format FORMAT     Non-interactive output: text, json, or stream-json"
     )?;
     writeln!(
         out,
@@ -14868,6 +15138,53 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_stream_json_as_json_with_stream_provenance() {
+        let _guard = env_lock();
+        std::env::remove_var("CLAW_OUTPUT_FORMAT");
+        let args = vec![
+            "--output-format=stream-json".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ];
+
+        let action = parse_args(&args).expect("stream-json should parse");
+        assert!(matches!(
+            action,
+            CliAction::Prompt {
+                output_format: CliOutputFormat::Json,
+                ..
+            }
+        ));
+        assert_eq!(
+            super::current_output_format_selection().raw.as_deref(),
+            Some("stream-json")
+        );
+        assert!(super::raw_args_request_json_output(&args));
+    }
+
+    #[test]
+    fn stream_json_reasoning_metadata_distinguishes_visible_and_redacted() {
+        let visible =
+            super::runtime_stream_event_json(runtime::RuntimeStreamEvent::ThinkingDelta {
+                text: "provider thought".to_string(),
+                source: "reasoning_details.text".to_string(),
+                visibility: "provider_returned".to_string(),
+            });
+        assert_eq!(visible["kind"], json!("thinking_delta"));
+        assert_eq!(visible["text"], json!("provider thought"));
+        assert_eq!(visible["reasoning_source"], json!("reasoning_details.text"));
+
+        let redacted =
+            super::runtime_stream_event_json(runtime::RuntimeStreamEvent::ThinkingDelta {
+                text: "provider emitted encrypted reasoning block".to_string(),
+                source: "reasoning_details.encrypted".to_string(),
+                visibility: "provider_redacted".to_string(),
+            });
+        assert_eq!(redacted["kind"], json!("thinking_redacted"));
+        assert!(redacted.get("text").is_none());
     }
 
     #[test]

@@ -567,18 +567,7 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
-            // Handle reasoning/thinking from various provider fields
-            if let Some(reasoning) = choice
-                .delta
-                .reasoning_content
-                .filter(|value| !value.is_empty())
-                .or(choice.delta.reasoning.filter(|value| !value.is_empty()))
-                .or(choice
-                    .delta
-                    .thinking
-                    .and_then(|t| t.content)
-                    .filter(|value| !value.is_empty()))
-            {
+            for reasoning in choice.delta.reasoning_fragments() {
                 if !self.thinking_started {
                     self.thinking_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -592,7 +581,9 @@ impl StreamState {
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                     index: 0,
                     delta: ContentBlockDelta::ThinkingDelta {
-                        thinking: reasoning,
+                        thinking: reasoning.text,
+                        source: Some(reasoning.source),
+                        visibility: Some(reasoning.visibility),
                     },
                 }));
             }
@@ -829,6 +820,8 @@ struct ChatMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     reasoning: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+    reasoning_details: Vec<ReasoningDetail>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
@@ -908,13 +901,50 @@ struct ChunkDelta {
     #[serde(default)]
     thinking: Option<ThinkingDelta>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+    reasoning_details: Vec<ReasoningDetail>,
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+impl ChunkDelta {
+    fn reasoning_fragments(&self) -> Vec<ReasoningFragment> {
+        reasoning_fragments(
+            [
+                ("reasoning_content", self.reasoning_content.as_deref()),
+                ("reasoning", self.reasoning.as_deref()),
+                (
+                    "thinking.content",
+                    self.thinking
+                        .as_ref()
+                        .and_then(|thinking| thinking.content.as_deref()),
+                ),
+            ],
+            self.reasoning_details.as_slice(),
+        )
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct ThinkingDelta {
     #[serde(default)]
     content: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReasoningDetail {
+    #[serde(default, rename = "type")]
+    detail_type: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReasoningFragment {
+    text: String,
+    source: String,
+    visibility: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1511,12 +1541,16 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
-    if let Some(thinking) = choice
-        .message
-        .reasoning_content
-        .filter(|value| !value.is_empty())
-        .or(choice.message.reasoning.filter(|value| !value.is_empty()))
-    {
+    if let Some(thinking) = first_non_empty_reasoning(
+        [
+            (
+                "reasoning_content",
+                choice.message.reasoning_content.as_deref(),
+            ),
+            ("reasoning", choice.message.reasoning.as_deref()),
+        ],
+        choice.message.reasoning_details.as_slice(),
+    ) {
         content.push(OutputContentBlock::Thinking {
             thinking,
             signature: None,
@@ -1553,6 +1587,84 @@ fn normalize_response(
 
 fn parse_tool_arguments(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+}
+
+fn first_non_empty_reasoning<const N: usize>(
+    fields: [(&str, Option<&str>); N],
+    details: &[ReasoningDetail],
+) -> Option<String> {
+    reasoning_fragments(fields, details)
+        .into_iter()
+        .find(|fragment| fragment.visibility == "provider_returned")
+        .map(|fragment| fragment.text)
+}
+
+fn reasoning_fragments<const N: usize>(
+    fields: [(&str, Option<&str>); N],
+    details: &[ReasoningDetail],
+) -> Vec<ReasoningFragment> {
+    let mut text_chunks = Vec::new();
+    let mut sources = Vec::new();
+    let mut redacted = Vec::new();
+
+    for (source, value) in fields {
+        if let Some(value) = value {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                text_chunks.push(trimmed.to_string());
+                sources.push(source.to_string());
+            }
+        }
+    }
+
+    let has_direct_reasoning_text = !text_chunks.is_empty();
+
+    for detail in details {
+        let detail_type = detail.detail_type.as_deref().unwrap_or("");
+        let is_encrypted_or_redacted =
+            detail_type.contains("encrypted") || detail_type.contains("redacted");
+        let text = detail
+            .text
+            .as_deref()
+            .or(detail.summary.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(text) = text {
+            let source = if detail.text.as_deref().is_some() {
+                "reasoning_details.text"
+            } else {
+                "reasoning_details.summary"
+            };
+            if is_encrypted_or_redacted {
+                redacted.push(ReasoningFragment {
+                    text: "provider emitted encrypted reasoning block".to_string(),
+                    source: source.to_string(),
+                    visibility: "provider_redacted".to_string(),
+                });
+            } else if !has_direct_reasoning_text {
+                text_chunks.push(text.to_string());
+                sources.push(source.to_string());
+            }
+        } else if is_encrypted_or_redacted {
+            redacted.push(ReasoningFragment {
+                text: "provider emitted encrypted reasoning block".to_string(),
+                source: "reasoning_details.encrypted".to_string(),
+                visibility: "provider_redacted".to_string(),
+            });
+        }
+    }
+
+    let mut fragments = Vec::new();
+    if !text_chunks.is_empty() {
+        sources.dedup();
+        fragments.push(ReasoningFragment {
+            text: text_chunks.join("\n"),
+            source: sources.join(","),
+            visibility: "provider_returned".to_string(),
+        });
+    }
+    fragments.extend(redacted);
+    fragments
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
@@ -1999,6 +2111,7 @@ mod tests {
                     content: Some("final answer".to_string()),
                     reasoning_content: Some("hidden thought".to_string()),
                     reasoning: None,
+                    reasoning_details: Vec::new(),
                     tool_calls: Vec::new(),
                 },
                 finish_reason: Some("stop".to_string()),
@@ -2038,6 +2151,7 @@ mod tests {
                         reasoning_content: Some("think".to_string()),
                         reasoning: None,
                         thinking: None,
+                        reasoning_details: Vec::new(),
                         tool_calls: Vec::new(),
                     },
                     finish_reason: None,
@@ -2056,6 +2170,7 @@ mod tests {
                             reasoning_content: None,
                             reasoning: None,
                             thinking: None,
+                            reasoning_details: Vec::new(),
                             tool_calls: Vec::new(),
                         },
                         finish_reason: Some("stop".to_string()),
@@ -2105,6 +2220,154 @@ mod tests {
             events[6],
             StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 1 })
         ));
+    }
+
+    #[test]
+    fn non_streaming_openrouter_reasoning_detail_emits_thinking_block() {
+        let response = super::ChatCompletionResponse {
+            id: "chatcmpl_reasoning_detail".to_string(),
+            model: "deepseek/deepseek-v4-pro".to_string(),
+            choices: vec![super::ChatChoice {
+                message: super::ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("final answer".to_string()),
+                    reasoning_content: None,
+                    reasoning: None,
+                    reasoning_details: vec![super::ReasoningDetail {
+                        detail_type: None,
+                        text: Some("detail thought".to_string()),
+                        summary: None,
+                    }],
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        };
+
+        let normalized =
+            normalize_response("deepseek/deepseek-v4-pro", response).expect("normalized");
+        assert!(matches!(
+            normalized.content.first(),
+            Some(OutputContentBlock::Thinking { thinking, .. }) if thinking == "detail thought"
+        ));
+    }
+
+    #[test]
+    fn streaming_reasoning_details_emit_text_and_redacted_metadata() {
+        let mut state = StreamState::new("deepseek/deepseek-v4-pro".to_string());
+        let events = state
+            .ingest_chunk(super::ChatCompletionChunk {
+                id: "chatcmpl_reasoning_details".to_string(),
+                model: Some("deepseek/deepseek-v4-pro".to_string()),
+                choices: vec![super::ChunkChoice {
+                    delta: super::ChunkDelta {
+                        content: None,
+                        reasoning_content: None,
+                        reasoning: None,
+                        thinking: None,
+                        reasoning_details: vec![
+                            super::ReasoningDetail {
+                                detail_type: Some("reasoning.text".to_string()),
+                                text: Some("first detail".to_string()),
+                                summary: None,
+                            },
+                            super::ReasoningDetail {
+                                detail_type: Some("reasoning.summary".to_string()),
+                                text: None,
+                                summary: Some("second detail".to_string()),
+                            },
+                            super::ReasoningDetail {
+                                detail_type: Some("reasoning.encrypted".to_string()),
+                                text: None,
+                                summary: None,
+                            },
+                        ],
+                        tool_calls: Vec::new(),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .expect("reasoning details chunk");
+
+        assert!(matches!(
+            events[2],
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::ThinkingDelta {
+                    ref thinking,
+                    ref source,
+                    ref visibility,
+                },
+                ..
+            }) if thinking == "first detail\nsecond detail"
+                && source.as_deref() == Some("reasoning_details.text,reasoning_details.summary")
+                && visibility.as_deref() == Some("provider_returned")
+        ));
+        assert!(matches!(
+            events[3],
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::ThinkingDelta {
+                    ref source,
+                    ref visibility,
+                    ..
+                },
+                ..
+            }) if source.as_deref() == Some("reasoning_details.encrypted")
+                && visibility.as_deref() == Some("provider_redacted")
+        ));
+    }
+
+    #[test]
+    fn streaming_reasoning_prefers_top_level_text_over_duplicate_details() {
+        let mut state = StreamState::new("deepseek/deepseek-v4-pro".to_string());
+        let events = state
+            .ingest_chunk(super::ChatCompletionChunk {
+                id: "chatcmpl_duplicate_reasoning".to_string(),
+                model: Some("deepseek/deepseek-v4-pro".to_string()),
+                choices: vec![super::ChunkChoice {
+                    delta: super::ChunkDelta {
+                        content: None,
+                        reasoning_content: None,
+                        reasoning: Some("top level chunk".to_string()),
+                        thinking: None,
+                        reasoning_details: vec![super::ReasoningDetail {
+                            detail_type: Some("reasoning.text".to_string()),
+                            text: Some("top level chunk".to_string()),
+                            summary: None,
+                        }],
+                        tool_calls: Vec::new(),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .expect("duplicate reasoning chunk");
+
+        assert!(matches!(
+            events[2],
+            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                delta: ContentBlockDelta::ThinkingDelta {
+                    ref thinking,
+                    ref source,
+                    ..
+                },
+                ..
+            }) if thinking == "top level chunk" && source.as_deref() == Some("reasoning")
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                        delta: ContentBlockDelta::ThinkingDelta { .. },
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]
