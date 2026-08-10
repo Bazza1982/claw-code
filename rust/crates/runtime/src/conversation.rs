@@ -43,6 +43,7 @@ const MAX_INDEPENDENT_REVIEW_PROMPT: &str = r#"MAX-EFFORT INDEPENDENT CRITICAL E
 PASS requires concrete evidence_refs and no unresolved critical/high finding or required change. REVISE requires an actionable finding or required change. BLOCK is reserved for an authorization boundary, irrecoverable contradiction, or exhausted safe route. When evidence is missing, truncated, ambiguous, or only asserted by the agent, do not infer success."#;
 const MAX_REVIEW_REVISION_PROMPT: &str = "MAX REVIEW REVISION REQUIRED. An independent evaluator rejected the previous plan or proposed completion. Address every required change using the active task scope and raw evidence. Use tools when necessary and allowed. Never convert missing or failed evidence into a success claim. If the evidence cannot be obtained, report the affected item as unverified or incomplete.";
 const MAX_REVIEW_MAX_REVISIONS: usize = 3;
+const MAX_TASK_FRAME_FORMAT_ATTEMPTS: usize = 3;
 const MAX_REVIEW_EVIDENCE_CHARS: usize = 120_000;
 const MAX_REVIEW_TOOL_RESULT_CHARS: usize = 12_000;
 const MAX_REVIEW_GOAL_AND_FRAME_CHARS: usize = 30_000;
@@ -950,9 +951,12 @@ where
                                 Some(&frame),
                                 Some(&reason),
                             );
-                            if let Err(first_error) = &revised_checkpoint {
+                            for format_attempt in 2..=MAX_TASK_FRAME_FORMAT_ATTEMPTS {
+                                let Err(previous_error) = &revised_checkpoint else {
+                                    break;
+                                };
                                 let recovery_reason = format!(
-                                    "{reason}\n\nTASK FRAME FORMAT RECOVERY: The previous revision response was invalid ({first_error}). Return exactly one complete TaskFrame JSON object that preserves the authoritative goal and boundaries while applying the evaluator's required changes. Do not return prose, markdown, a review verdict, or a partial patch."
+                                    "{reason}\n\nTASK FRAME FORMAT RECOVERY ATTEMPT {format_attempt}/{MAX_TASK_FRAME_FORMAT_ATTEMPTS}: The previous revision response was invalid ({previous_error}). Return exactly one complete TaskFrame JSON object that preserves the authoritative goal and boundaries while applying the evaluator's required changes. Do not return prose, markdown, a review verdict, or a partial patch."
                                 );
                                 revised_checkpoint = self.run_task_checkpoint(
                                     &authoritative_goal,
@@ -3975,7 +3979,7 @@ mod tests {
                         .any(|part| part.contains("add an author-specific negative-path check"));
                     if revised {
                         self.planning_replans += 1;
-                        if self.planning_replans == 1 {
+                        if self.planning_replans <= 2 {
                             return Ok(vec![
                                 AssistantEvent::TextDelta(
                                     "I revised the verification plan as requested.".to_string(),
@@ -4069,7 +4073,7 @@ mod tests {
             "The first check failed; the corrective author-specific rerun passed."
         );
         assert_eq!(runtime.api_client_mut().planning_reviews, 2);
-        assert_eq!(runtime.api_client_mut().planning_replans, 2);
+        assert_eq!(runtime.api_client_mut().planning_replans, 3);
         assert_eq!(runtime.api_client_mut().evidence_reviews, 2);
         assert_eq!(runtime.api_client_mut().claim_reviews, 2);
         let acknowledgement_index = observed
