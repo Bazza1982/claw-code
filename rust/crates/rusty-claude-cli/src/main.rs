@@ -7265,6 +7265,17 @@ fn cli_max_iterations() -> usize {
         })
 }
 
+fn cli_task_planning_enabled() -> bool {
+    std::env::var("CLAW_TASK_PLANNING")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 fn cli_auto_compaction_threshold(model: &str) -> u32 {
     runtime::auto_compaction_threshold_override_from_env()
         .unwrap_or_else(|| model_auto_compaction_threshold(model))
@@ -12670,6 +12681,7 @@ fn build_runtime_with_plugin_state(
         &feature_config,
     )
     .with_max_iterations(cli_max_iterations())
+    .with_task_planning_enabled(cli_task_planning_enabled())
     .with_auto_compaction_input_tokens_threshold(auto_compaction_threshold);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
@@ -13478,6 +13490,23 @@ fn runtime_stream_event_json(event: RuntimeStreamEvent) -> serde_json::Value {
             } else {
                 format!("{name} completed")
             },
+        }),
+        RuntimeStreamEvent::TaskAcknowledgement { text } => json!({
+            "kind": "task_acknowledgement",
+            "text": text,
+            "summary": text,
+        }),
+        RuntimeStreamEvent::TaskPlan { phase, frame } => json!({
+            "kind": "task_plan",
+            "phase": phase,
+            "summary": if phase == "initial" { "Claw task plan created" } else { "Claw task plan updated" },
+            "frame": frame,
+        }),
+        RuntimeStreamEvent::PlanDivergence { tool_name, reason } => json!({
+            "kind": "plan_divergence",
+            "tool_name": tool_name,
+            "reason": reason,
+            "summary": format!("Plan telemetry: {tool_name} was not named in the current task plan"),
         }),
     }
 }
