@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
@@ -1918,12 +1918,63 @@ where
 }
 
 fn parse_task_frame(raw: &str) -> Option<TaskFrame> {
-    let trimmed = raw.trim();
-    serde_json::from_str(trimmed).ok().or_else(|| {
-        let start = trimmed.find('{')?;
-        let end = trimmed.rfind('}')?;
-        serde_json::from_str(&trimmed[start..=end]).ok()
+    parse_json_object_matching(raw, |frame: &TaskFrame| {
+        !frame.acknowledgement.trim().is_empty() && !frame.active_goal.trim().is_empty()
     })
+}
+
+fn parse_json_object_matching<T, F>(raw: &str, predicate: F) -> Option<T>
+where
+    T: DeserializeOwned,
+    F: Fn(&T) -> bool,
+{
+    let trimmed = raw.trim();
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        if predicate(&value) {
+            return Some(value);
+        }
+    }
+
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in trimmed.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match character {
+            '"' if depth > 0 => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let object_start = start.take()?;
+                    let object_end = index + character.len_utf8();
+                    if let Ok(value) = serde_json::from_str(&trimmed[object_start..object_end]) {
+                        if predicate(&value) {
+                            return Some(value);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_independent_review(raw: &str) -> Result<IndependentReview, String> {
@@ -3556,6 +3607,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("assistant stream ended without a message stop event"));
+    }
+
+    #[test]
+    fn task_frame_parser_ignores_additional_bridge_json_objects() {
+        let raw = r#"
+<memory_plus_update>{"write":false,"facts":[]}</memory_plus_update>
+```json
+{"acknowledgement":"陛下，奴婢会处理 {approved scope}。","active_goal":"apply only the approved updates","success_criteria":["approved work completes"],"planned_actions":["inspect","execute","verify"],"planned_tools":["bash"],"do_not_do":["do not expand scope"],"completed":[],"remaining_work":["execute"],"failures":[],"next_action":"inspect"}
+```
+<memory_plus_update>{"write":true,"completed":["not task-frame evidence"]}</memory_plus_update>
+"#;
+
+        let frame = super::parse_task_frame(raw).expect("embedded task frame should parse");
+
+        assert_eq!(frame.active_goal, "apply only the approved updates");
+        assert_eq!(frame.acknowledgement, "陛下，奴婢会处理 {approved scope}。");
     }
 
     #[test]
