@@ -19,6 +19,7 @@ mod input;
 mod render;
 mod setup_wizard;
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -1397,13 +1398,12 @@ impl Default for OutputFormatSelection {
     }
 }
 
-static OUTPUT_FORMAT_SELECTION: OnceLock<Mutex<OutputFormatSelection>> = OnceLock::new();
+thread_local! {
+    static OUTPUT_FORMAT_SELECTION: RefCell<OutputFormatSelection> =
+        RefCell::new(OutputFormatSelection::default());
+}
 // #468: duplicate global flag occurrences for provenance reporting
 static DUPLICATE_FLAGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-
-fn output_format_selection_cell() -> &'static Mutex<OutputFormatSelection> {
-    OUTPUT_FORMAT_SELECTION.get_or_init(|| Mutex::new(OutputFormatSelection::default()))
-}
 
 fn duplicate_flags_cell() -> &'static Mutex<Vec<String>> {
     DUPLICATE_FLAGS.get_or_init(|| Mutex::new(Vec::new()))
@@ -1423,16 +1423,13 @@ fn take_duplicate_flags() -> Vec<String> {
 }
 
 fn set_current_output_format_selection(selection: &OutputFormatSelection) {
-    *output_format_selection_cell()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = selection.clone();
+    OUTPUT_FORMAT_SELECTION.with(|current| {
+        *current.borrow_mut() = selection.clone();
+    });
 }
 
 fn current_output_format_selection() -> OutputFormatSelection {
-    output_format_selection_cell()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+    OUTPUT_FORMAT_SELECTION.with(|current| current.borrow().clone())
 }
 
 fn cli_has_output_format_flag(args: &[String]) -> bool {
