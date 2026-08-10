@@ -44,6 +44,7 @@ PASS requires concrete evidence_refs and no unresolved critical/high finding or 
 const MAX_REVIEW_REVISION_PROMPT: &str = "MAX REVIEW REVISION REQUIRED. An independent evaluator rejected the previous plan or proposed completion. Address every required change using the active task scope and raw evidence. Use tools when necessary and allowed. Never convert missing or failed evidence into a success claim. If the evidence cannot be obtained, report the affected item as unverified or incomplete.";
 const MAX_REVIEW_MAX_REVISIONS: usize = 3;
 const MAX_TASK_FRAME_FORMAT_ATTEMPTS: usize = 3;
+const MAX_INDEPENDENT_REVIEW_FORMAT_ATTEMPTS: usize = 3;
 const MAX_REVIEW_EVIDENCE_CHARS: usize = 120_000;
 const MAX_REVIEW_TOOL_RESULT_CHARS: usize = 12_000;
 const MAX_REVIEW_GOAL_AND_FRAME_CHARS: usize = 30_000;
@@ -741,7 +742,7 @@ where
         };
         let mut prompt_cache_events = Vec::new();
         let mut last_error = None;
-        for format_attempt in 1..=2 {
+        for format_attempt in 1..=MAX_INDEPENDENT_REVIEW_FORMAT_ATTEMPTS {
             let request = ApiRequest {
                 // Deliberately exclude the task-performing system prompt and
                 // conversation history. The same provider receives a clean,
@@ -749,7 +750,9 @@ where
                 system_prompt: vec![
                     MAX_INDEPENDENT_REVIEW_PROMPT.to_string(),
                     gate_instruction.to_string(),
-                    format!("FORMAT ATTEMPT: {format_attempt}/2"),
+                    format!(
+                        "FORMAT ATTEMPT: {format_attempt}/{MAX_INDEPENDENT_REVIEW_FORMAT_ATTEMPTS}"
+                    ),
                 ],
                 messages: vec![ConversationMessage::user_text(&artifact)],
                 allow_tools: false,
@@ -786,7 +789,7 @@ where
             }
         }
         Err(RuntimeError::new(format!(
-            "max independent {gate} review returned an invalid verdict twice: {}",
+            "max independent {gate} review returned an invalid verdict after {MAX_INDEPENDENT_REVIEW_FORMAT_ATTEMPTS} format attempts: {}",
             last_error.unwrap_or_else(|| "unknown validation error".to_string())
         )))
     }
@@ -3920,6 +3923,10 @@ mod tests {
                     .iter()
                     .any(|part| part.contains("MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR"));
                 if is_independent {
+                    assert!(request
+                        .system_prompt
+                        .iter()
+                        .any(|part| part == "FORMAT ATTEMPT: 1/3"));
                     let artifact = request
                         .messages
                         .first()
