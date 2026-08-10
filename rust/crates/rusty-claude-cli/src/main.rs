@@ -7276,6 +7276,19 @@ fn cli_task_planning_enabled() -> bool {
         })
 }
 
+fn cli_task_assurance() -> (bool, usize) {
+    task_assurance_for_effort(&std::env::var("CLAW_EXECUTION_EFFORT").unwrap_or_default())
+}
+
+fn task_assurance_for_effort(effort: &str) -> (bool, usize) {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "high" => (true, 6),
+        "xhigh" => (true, 8),
+        "max" => (true, 12),
+        _ => (false, 0),
+    }
+}
+
 fn cli_auto_compaction_threshold(model: &str) -> u32 {
     runtime::auto_compaction_threshold_override_from_env()
         .unwrap_or_else(|| model_auto_compaction_threshold(model))
@@ -12662,6 +12675,7 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let (task_assurance_enabled, finalization_reserve) = cli_task_assurance();
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -12685,6 +12699,7 @@ fn build_runtime_with_plugin_state(
     )
     .with_max_iterations(cli_max_iterations())
     .with_task_planning_enabled(cli_task_planning_enabled())
+    .with_task_assurance(task_assurance_enabled, finalization_reserve)
     .with_auto_compaction_input_tokens_threshold(auto_compaction_threshold);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
@@ -20042,6 +20057,14 @@ UU conflicted.rs",
                 assert_eq!(reasoning_effort.as_deref(), Some(value));
             }
         }
+    }
+
+    #[test]
+    fn high_and_above_efforts_enable_task_assurance_reserves() {
+        assert_eq!(crate::task_assurance_for_effort("medium"), (false, 0));
+        assert_eq!(crate::task_assurance_for_effort("high"), (true, 6));
+        assert_eq!(crate::task_assurance_for_effort("xhigh"), (true, 8));
+        assert_eq!(crate::task_assurance_for_effort("max"), (true, 12));
     }
 
     #[test]
