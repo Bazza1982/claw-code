@@ -724,6 +724,7 @@ where
         gate: &str,
         authoritative_goal: &str,
         task_frame: &TaskFrame,
+        task_messages: &[ConversationMessage],
         tool_results: &[ConversationMessage],
         proposed_answer: Option<&ConversationMessage>,
     ) -> Result<(IndependentReview, Vec<PromptCacheEvent>), RuntimeError> {
@@ -731,12 +732,13 @@ where
             gate,
             authoritative_goal,
             task_frame,
+            task_messages,
             tool_results,
             proposed_answer,
         );
         let gate_instruction = match gate {
             "planning" => "PLANNING GATE: Critique the plan before any task tools run. Test requirement coverage, authorization boundaries, assumptions, verification design, test design, failure criteria, and whether the proposed evidence could actually prove success. At this gate, task-tool evidence is absent by construction. Do not require actual-state, preflight, version, health, test, registry, or other tool-derived evidence as a condition for allowing the tools that would collect it. Treat explicitly planned future evidence collection as remaining work, not as a missing-evidence defect, when the plan names task-matched sources, pass/fail criteria, safety stop conditions, and what must remain unverified if collection fails. Do not require an additional independent observer: the later execution-evidence and final-claim gates provide independent review after tools run. REVISE when the evidence design or safety gates are inadequate; BLOCK only for the reserved authorization, contradiction, or exhausted-safe-route conditions, not merely because planned evidence does not exist yet.",
-            "execution_evidence" => "EXECUTION EVIDENCE GATE: Critique the actual verification and testing execution after task activity. Raw tool results outrank the task frame, generated files, and the agent's proposed answer. Check each success criterion and identify failed, skipped, ambiguous, truncated, irrelevant, or non-author-specific evidence.",
+            "execution_evidence" => "EXECUTION EVIDENCE GATE: Critique the actual verification and testing execution after task activity. Raw tool calls and results outrank the task frame, generated files, and the agent's proposed answer. Audit every tool name and input against the authoritative goal and do_not_do boundaries, including read-only exploration outside an explicitly named target. Check each success criterion and identify unauthorized, failed, skipped, ambiguous, truncated, irrelevant, or non-author-specific evidence.",
             "final_claim" => "FINAL CLAIM GATE: Audit every material completion claim in the proposed user-visible answer against raw evidence. Reject stronger-than-evidence wording, hidden failures, date or count contradictions, fallback presented as primary-path success, and unverified state recorded as verified.",
             _ => "Critically evaluate the supplied task artifacts and raw evidence.",
         };
@@ -938,6 +940,7 @@ where
                         "planning",
                         &authoritative_goal,
                         &frame,
+                        &[],
                         &[],
                         None,
                     ) {
@@ -1289,6 +1292,7 @@ where
                         "execution_evidence",
                         &authoritative_goal,
                         frame,
+                        &assistant_messages,
                         &tool_results,
                         Some(&assistant_message),
                     ) {
@@ -1336,6 +1340,7 @@ where
                         "final_claim",
                         &authoritative_goal,
                         frame,
+                        &assistant_messages,
                         &tool_results,
                         Some(&assistant_message),
                     ) {
@@ -2153,6 +2158,7 @@ fn independent_review_artifact(
     gate: &str,
     authoritative_goal: &str,
     task_frame: &TaskFrame,
+    task_messages: &[ConversationMessage],
     tool_results: &[ConversationMessage],
     proposed_answer: Option<&ConversationMessage>,
 ) -> String {
@@ -2173,11 +2179,31 @@ fn independent_review_artifact(
     );
     let fixed_sections_chars = goal_and_frame.chars().count()
         + proposed_answer.chars().count()
-        + "\n\nRAW TOOL EVIDENCE LEDGER:\n\nPROPOSED USER-VISIBLE ANSWER (agent-authored; audit its claims):\n"
+        + "\n\nRAW TOOL CALL LEDGER:\n\nRAW TOOL RESULT LEDGER:\n\nPROPOSED USER-VISIBLE ANSWER (agent-authored; audit its claims):\n"
             .chars()
             .count();
     let evidence_budget = MAX_REVIEW_EVIDENCE_CHARS.saturating_sub(fixed_sections_chars);
     let mut evidence = String::new();
+    if task_messages.is_empty() {
+        evidence.push_str("[no task tool calls]\n");
+    }
+    'calls: for (index, message) in task_messages.iter().enumerate() {
+        for block in &message.blocks {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                let input = truncate_chars(input, MAX_REVIEW_TOOL_RESULT_CHARS);
+                let entry = format!("[{index}] id={id} tool={name} input={input}\n---\n");
+                if evidence.chars().count() + entry.chars().count() > evidence_budget {
+                    evidence.push_str(
+                        "[TOOL CALL LEDGER TRUNCATED: treat scope compliance as unverified]\n",
+                    );
+                    evidence = truncate_chars(&evidence, evidence_budget);
+                    break 'calls;
+                }
+                evidence.push_str(&entry);
+            }
+        }
+    }
+    evidence.push_str("\nRAW TOOL RESULT LEDGER:\n");
     if tool_results.is_empty() {
         evidence.push_str("[no task tool results]\n");
     }
@@ -2205,7 +2231,7 @@ fn independent_review_artifact(
         }
     }
     format!(
-        "{goal_and_frame}\n\nRAW TOOL EVIDENCE LEDGER:\n{evidence}\nPROPOSED USER-VISIBLE ANSWER (agent-authored; audit its claims):\n{proposed_answer}"
+        "{goal_and_frame}\n\nRAW TOOL CALL LEDGER:\n{evidence}\nPROPOSED USER-VISIBLE ANSWER (agent-authored; audit its claims):\n{proposed_answer}"
     )
 }
 
@@ -3997,6 +4023,7 @@ mod tests {
             "final_claim",
             "verify the result",
             &frame,
+            &[],
             &tool_results,
             Some(&proposed_answer),
         );
@@ -4056,6 +4083,8 @@ mod tests {
                         .any(|part| part.contains("EXECUTION EVIDENCE GATE"))
                     {
                         self.evidence_reviews += 1;
+                        assert!(artifact.contains("RAW TOOL CALL LEDGER"));
+                        assert!(artifact.contains("tool=verify input=target"));
                         if self.evidence_reviews == 1 {
                             assert!(artifact.contains("verified=false"));
                             assert!(artifact.contains("Everything is verified."));
