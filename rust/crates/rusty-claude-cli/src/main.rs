@@ -1045,6 +1045,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
             resume_session(&session_path, &commands, output_format)
         }
+        CliAction::ResumePrompt {
+            session_reference,
+            prompt,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+            compact,
+            reasoning_effort,
+            allow_broad_cwd,
+        } => {
+            enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
+            let stdin_context = if matches!(permission_mode, PermissionMode::DangerFullAccess) {
+                read_piped_stdin()
+            } else {
+                None
+            };
+            let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            let resolved_model = resolve_repl_model(model)?;
+            let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+            cli.resume_session_quiet(&session_reference)?;
+            cli.set_reasoning_effort(reasoning_effort);
+            let stream_json = current_output_format_selection()
+                .raw
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("stream-json"));
+            cli.run_turn_with_output(&effective_prompt, output_format, compact, stream_json)?;
+        }
         CliAction::Status {
             model,
             model_flag_raw,
@@ -1208,6 +1236,17 @@ enum CliAction {
         session_path: PathBuf,
         commands: Vec<String>,
         output_format: CliOutputFormat,
+        allow_broad_cwd: bool,
+    },
+    ResumePrompt {
+        session_reference: String,
+        prompt: String,
+        model: String,
+        output_format: CliOutputFormat,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        compact: bool,
+        reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
     },
     Status {
@@ -1901,9 +1940,33 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return action;
     }
     if rest.first().map(String::as_str) == Some("--resume") {
+        if let Some(action) = parse_resume_prompt_args(
+            &rest[1..],
+            &model,
+            output_format,
+            allowed_tools.clone(),
+            permission_mode_override.unwrap_or_else(default_permission_mode),
+            compact,
+            reasoning_effort.clone(),
+            allow_broad_cwd,
+        ) {
+            return action;
+        }
         return parse_resume_args(&rest[1..], output_format, allow_broad_cwd);
     }
     if rest.first().map(String::as_str) == Some("resume") {
+        if let Some(action) = parse_resume_prompt_args(
+            &rest[1..],
+            &model,
+            output_format,
+            allowed_tools.clone(),
+            permission_mode_override.unwrap_or_else(default_permission_mode),
+            compact,
+            reasoning_effort.clone(),
+            allow_broad_cwd,
+        ) {
+            return action;
+        }
         return parse_resume_args(&rest[1..], output_format, allow_broad_cwd);
     }
     // #696: `claw compact` is the bare name of the interactive `/compact`
@@ -3397,6 +3460,44 @@ fn parse_resume_args(
         output_format,
         allow_broad_cwd,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_resume_prompt_args(
+    args: &[String],
+    model: &str,
+    output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    compact: bool,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+) -> Option<Result<CliAction, String>> {
+    let (session_reference, prompt_tokens) = match args {
+        [command, prompt @ ..] if command == "prompt" => {
+            (LATEST_SESSION_REFERENCE.to_string(), prompt)
+        }
+        [session, command, prompt @ ..] if command == "prompt" => (session.clone(), prompt),
+        _ => return None,
+    };
+    let prompt = prompt_tokens.join(" ");
+    if prompt.trim().is_empty() {
+        return Some(Err(
+            "missing_prompt: resumed prompt requires a prompt string.\nUsage: claw --resume <session-id|latest> prompt <text>"
+                .to_string(),
+        ));
+    }
+    Some(Ok(CliAction::ResumePrompt {
+        session_reference,
+        prompt,
+        model: model.to_string(),
+        output_format,
+        allowed_tools,
+        permission_mode,
+        compact,
+        reasoning_effort,
+        allow_broad_cwd,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8591,6 +8692,32 @@ impl LiveCli {
         Ok(true)
     }
 
+    fn resume_session_quiet(
+        &mut self,
+        session_ref: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (handle, session) =
+            load_session_reference_excluding(session_ref, Some(&self.session.id))?;
+        let session_id = session.session_id.clone();
+        let runtime = build_runtime(
+            session,
+            &handle.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        self.replace_runtime(runtime)?;
+        self.session = SessionHandle {
+            id: session_id,
+            path: handle.path,
+        };
+        Ok(())
+    }
+
     fn print_config(section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", render_config_report(section)?);
         Ok(())
@@ -10235,7 +10362,7 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Related          claw status · ROADMAP #139 (this worker-concept contract)"
             .to_string(),
         LocalHelpTopic::Resume => format!(
-            "Resume\n  Usage            claw resume [session-path|session-id|{LATEST_SESSION_REFERENCE}] [/slash-command ...] [--output-format <format>]\n  Alias            claw --resume [session-path|session-id|{LATEST_SESSION_REFERENCE}]\n  Purpose          restore or inspect a saved session without starting a new provider turn\n  Output           session restore or resume-safe command output; missing sessions return session_not_found\n  Formats          text (default), json\n  Related          /resume · /session list · claw --resume {LATEST_SESSION_REFERENCE} /status"
+            "Resume\n  Usage            claw resume [session-path|session-id|{LATEST_SESSION_REFERENCE}] [/slash-command ...] [--output-format <format>]\n  Continue         claw --resume <session> prompt <text>\n  Alias            claw --resume [session-path|session-id|{LATEST_SESSION_REFERENCE}]\n  Purpose          inspect a saved session or continue it with one provider turn\n  Output           session command output or the continued assistant response; missing sessions return session_not_found\n  Formats          text (default), json, stream-json for prompt continuation\n  Related          /resume · /session list · claw --resume {LATEST_SESSION_REFERENCE} /status"
         ),
         LocalHelpTopic::Session => "Session
   Usage            claw session --help [--output-format <format>]
@@ -14363,6 +14490,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Inspect or maintain a saved session without entering the REPL"
     )?;
+    writeln!(
+        out,
+        "  claw --resume [SESSION.jsonl|session-id|latest] prompt TEXT"
+    )?;
+    writeln!(out, "      Continue a saved session with one provider turn")?;
     writeln!(out, "  claw help")?;
     writeln!(out, "      Alias for --help")?;
     writeln!(out, "  claw version")?;
@@ -17425,6 +17557,37 @@ mod tests {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/compact".to_string()],
                 output_format: CliOutputFormat::Text,
+                allow_broad_cwd: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_resume_flag_with_prompt_continuation() {
+        let args = vec![
+            "--model".to_string(),
+            "deepseek/deepseek-v4-pro".to_string(),
+            "--permission-mode".to_string(),
+            "danger-full-access".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--resume".to_string(),
+            "session-123".to_string(),
+            "prompt".to_string(),
+            "continue".to_string(),
+            "the task".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("resumed prompt should parse"),
+            CliAction::ResumePrompt {
+                session_reference: "session-123".to_string(),
+                prompt: "continue the task".to_string(),
+                model: "deepseek/deepseek-v4-pro".to_string(),
+                output_format: CliOutputFormat::Json,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                compact: false,
+                reasoning_effort: None,
                 allow_broad_cwd: false,
             }
         );
