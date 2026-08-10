@@ -867,7 +867,7 @@ where
             if pending_tool_uses.is_empty() {
                 let has_visible_text = assistant_messages
                     .last()
-                    .is_some_and(|message| !visible_text(message).trim().is_empty());
+                    .is_some_and(|message| !user_visible_text(message).trim().is_empty());
                 if has_visible_text {
                     break;
                 }
@@ -1586,6 +1586,26 @@ fn visible_text(message: &ConversationMessage) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn user_visible_text(message: &ConversationMessage) -> String {
+    const MEMORY_PLUS_OPEN: &str = "<memory_plus_update>";
+    const MEMORY_PLUS_CLOSE: &str = "</memory_plus_update>";
+
+    let mut text = visible_text(message);
+    loop {
+        let normalized = text.to_ascii_lowercase();
+        let Some(start) = normalized.find(MEMORY_PLUS_OPEN) else {
+            break;
+        };
+        let content_start = start + MEMORY_PLUS_OPEN.len();
+        let Some(relative_end) = normalized[content_start..].find(MEMORY_PLUS_CLOSE) else {
+            break;
+        };
+        let end = content_start + relative_end + MEMORY_PLUS_CLOSE.len();
+        text.replace_range(start..end, "");
+    }
+    text
 }
 
 fn deterministic_no_final_text_report(
@@ -3309,6 +3329,60 @@ mod tests {
         assert_eq!(summary.completion_status, CompletionStatus::Completed);
         assert_eq!(summary.stop_reason, TurnStopReason::EndTurn);
         assert_eq!(summary.provider_stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            super::visible_text(summary.assistant_messages.last().unwrap()),
+            "visible final answer"
+        );
+    }
+
+    #[test]
+    fn memory_update_only_response_gets_visible_finalization_retry() {
+        struct MemoryOnlyApi {
+            calls: usize,
+        }
+
+        impl ApiClient for MemoryOnlyApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "<memory_plus_update>\n{\"write\":false}\n</memory_plus_update>"
+                                .to_string(),
+                        ),
+                        AssistantEvent::ProviderStopReason("end_turn".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                assert!(!request.allow_tools);
+                assert!(request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("VISIBLE FINALIZATION RECOVERY")));
+                Ok(vec![
+                    AssistantEvent::TextDelta("visible final answer".to_string()),
+                    AssistantEvent::ProviderStopReason("end_turn".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MemoryOnlyApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(4);
+
+        let summary = runtime
+            .run_turn("report", None)
+            .expect("control-only output should trigger a visible retry");
+
+        assert_eq!(summary.iterations, 2);
+        assert_eq!(summary.completion_status, CompletionStatus::Completed);
+        assert_eq!(summary.stop_reason, TurnStopReason::EndTurn);
         assert_eq!(
             super::visible_text(summary.assistant_messages.last().unwrap()),
             "visible final answer"
