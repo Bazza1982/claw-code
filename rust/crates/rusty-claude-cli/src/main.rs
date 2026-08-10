@@ -7280,6 +7280,16 @@ fn cli_task_assurance() -> (bool, usize) {
     task_assurance_for_effort(&std::env::var("CLAW_EXECUTION_EFFORT").unwrap_or_default())
 }
 
+fn cli_max_independent_review_enabled() -> bool {
+    std::env::var("CLAW_EXECUTION_EFFORT")
+        .ok()
+        .is_some_and(|effort| max_independent_review_for_effort(&effort))
+}
+
+fn max_independent_review_for_effort(effort: &str) -> bool {
+    effort.trim().eq_ignore_ascii_case("max")
+}
+
 fn task_assurance_for_effort(effort: &str) -> (bool, usize) {
     match effort.trim().to_ascii_lowercase().as_str() {
         "high" => (true, 6),
@@ -12700,6 +12710,7 @@ fn build_runtime_with_plugin_state(
     .with_max_iterations(cli_max_iterations())
     .with_task_planning_enabled(cli_task_planning_enabled())
     .with_task_assurance(task_assurance_enabled, finalization_reserve)
+    .with_max_independent_review(cli_max_independent_review_enabled())
     .with_auto_compaction_input_tokens_threshold(auto_compaction_threshold);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
@@ -13541,6 +13552,17 @@ fn runtime_stream_event_json(event: RuntimeStreamEvent) -> serde_json::Value {
             "phase": phase,
             "summary": if phase == "initial" { "Claw task plan created" } else { "Claw task plan updated" },
             "frame": frame,
+        }),
+        RuntimeStreamEvent::IndependentReview {
+            gate,
+            revision_round,
+            review,
+        } => json!({
+            "kind": "independent_review",
+            "gate": gate,
+            "revision_round": revision_round,
+            "summary": review.summary,
+            "review": review,
         }),
         RuntimeStreamEvent::PlanDivergence { tool_name, reason } => json!({
             "kind": "plan_divergence",
@@ -20065,6 +20087,10 @@ UU conflicted.rs",
         assert_eq!(crate::task_assurance_for_effort("high"), (true, 6));
         assert_eq!(crate::task_assurance_for_effort("xhigh"), (true, 8));
         assert_eq!(crate::task_assurance_for_effort("max"), (true, 12));
+        assert!(!crate::max_independent_review_for_effort("medium"));
+        assert!(!crate::max_independent_review_for_effort("high"));
+        assert!(!crate::max_independent_review_for_effort("xhigh"));
+        assert!(crate::max_independent_review_for_effort("MAX"));
     }
 
     #[test]
