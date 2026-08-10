@@ -7154,6 +7154,8 @@ struct LiveCli {
     prompt_history: Vec<PromptHistoryEntry>,
 }
 
+const DEFAULT_CLI_MAX_ITERATIONS: usize = 32;
+
 #[derive(Debug, Clone)]
 struct PromptHistoryEntry {
     timestamp_ms: u64,
@@ -8025,6 +8027,7 @@ impl LiveCli {
                 "message": final_assistant_text(&summary),
                 "compact": true,
                 "model": self.model,
+                "session_id": self.session.id,
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -8049,6 +8052,7 @@ impl LiveCli {
             json!({
                 "message": final_assistant_text(&summary),
                 "model": self.model,
+                "session_id": self.session.id,
                 "iterations": summary.iterations,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
@@ -8082,6 +8086,7 @@ impl LiveCli {
             json!({
                 "kind": "run_started",
                 "model": self.model,
+                "session_id": self.session.id,
             })
         );
         io::stdout().flush()?;
@@ -8102,6 +8107,7 @@ impl LiveCli {
                 "kind": "run_finished",
                 "message": final_assistant_text(&summary),
                 "model": self.model,
+                "session_id": self.session.id,
                 "iterations": summary.iterations,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
@@ -12504,7 +12510,8 @@ fn build_runtime_with_plugin_state(
         policy,
         system_prompt,
         &feature_config,
-    );
+    )
+    .with_max_iterations(DEFAULT_CLI_MAX_ITERATIONS);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }

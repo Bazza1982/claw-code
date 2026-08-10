@@ -485,12 +485,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: "Execute a shell command in the current workspace. Timeout values are seconds.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout_seconds": { "type": "integer", "minimum": 1, "description": "Maximum runtime in seconds." },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" },

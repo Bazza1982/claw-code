@@ -20,7 +20,13 @@ use crate::ConfigLoader;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BashCommandInput {
     pub command: String,
-    pub timeout: Option<u64>,
+    /// Canonical timeout contract exposed to models, in seconds.
+    pub timeout_seconds: Option<u64>,
+    /// Backward-compatible parser for older callers. This field is no longer
+    /// advertised in the tool schema and retains its historical millisecond
+    /// semantics.
+    #[serde(default, rename = "timeout")]
+    pub legacy_timeout_ms: Option<u64>,
     pub description: Option<String>,
     #[serde(rename = "run_in_background")]
     pub run_in_background: Option<bool>,
@@ -176,7 +182,11 @@ async fn execute_bash_async(
 
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
-    let output_result = if let Some(timeout_ms) = input.timeout {
+    let resolved_timeout_ms = input
+        .timeout_seconds
+        .map(|seconds| seconds.saturating_mul(1_000))
+        .or(input.legacy_timeout_ms);
+    let output_result = if let Some(timeout_ms) = resolved_timeout_ms {
         if let Ok(result) = timeout(Duration::from_millis(timeout_ms), command.output()).await {
             (result?, false)
         } else {
@@ -362,10 +372,30 @@ mod tests {
     use crate::sandbox::FilesystemIsolationMode;
 
     #[test]
+    fn canonical_timeout_is_seconds_and_legacy_timeout_remains_milliseconds() {
+        let canonical: BashCommandInput = serde_json::from_value(serde_json::json!({
+            "command": "printf ok",
+            "timeout_seconds": 60
+        }))
+        .expect("canonical timeout should parse");
+        assert_eq!(canonical.timeout_seconds, Some(60));
+        assert_eq!(canonical.legacy_timeout_ms, None);
+
+        let legacy: BashCommandInput = serde_json::from_value(serde_json::json!({
+            "command": "printf ok",
+            "timeout": 60
+        }))
+        .expect("legacy timeout should parse");
+        assert_eq!(legacy.timeout_seconds, None);
+        assert_eq!(legacy.legacy_timeout_ms, Some(60));
+    }
+
+    #[test]
     fn executes_simple_command() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
-            timeout: Some(1_000),
+            timeout_seconds: Some(1),
+            legacy_timeout_ms: None,
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(false),
@@ -385,7 +415,8 @@ mod tests {
     fn disables_sandbox_when_requested() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
-            timeout: Some(1_000),
+            timeout_seconds: Some(1),
+            legacy_timeout_ms: None,
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),
@@ -403,7 +434,8 @@ mod tests {
     fn timed_out_test_command_is_classified_as_hung_test_with_provenance() {
         let output = execute_bash(BashCommandInput {
             command: String::from("sleep 1 # cargo test slow_case"),
-            timeout: Some(1),
+            timeout_seconds: None,
+            legacy_timeout_ms: Some(1),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(false),
@@ -428,7 +460,8 @@ mod tests {
     fn prevents_stdin_hangs_by_redirecting_to_null() {
         let output = execute_bash(BashCommandInput {
             command: String::from("cat"),
-            timeout: Some(2_000),
+            timeout_seconds: Some(2),
+            legacy_timeout_ms: None,
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),

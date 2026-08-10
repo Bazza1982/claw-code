@@ -254,7 +254,11 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     // route to the correct provider regardless of which auth env vars are set.
     // Without this, detect_provider_kind falls through to the auth-sniffer
     // order and misroutes to Anthropic if ANTHROPIC_API_KEY is present.
-    if canonical.starts_with("openai/") || canonical.starts_with("gpt-") {
+    if canonical.starts_with("openai/")
+        || canonical.starts_with("gpt-")
+        || canonical.starts_with("deepseek/")
+        || canonical.starts_with("deepseek-")
+    {
         return Some(ProviderMetadata {
             provider: ProviderKind::OpenAi,
             auth_env: "OPENAI_API_KEY",
@@ -935,16 +939,19 @@ mod tests {
         let claude_model = "claude-opus-4-6";
         let openai_model = "openai/gpt-4.1-mini";
         let xai_model = "grok-3";
+        let deepseek_model = "deepseek/deepseek-v4-pro";
 
         // when: detecting prompt model family identities from model names
         let claude_identity = model_family_identity_for(claude_model);
         let openai_identity = model_family_identity_for(openai_model);
         let xai_identity = model_family_identity_for(xai_model);
+        let deepseek_identity = model_family_identity_for(deepseek_model);
 
         // then: Anthropic stays Claude and OpenAI-compatible providers are generic
         assert_eq!(claude_identity, runtime::ModelFamilyIdentity::Claude);
         assert_eq!(openai_identity, runtime::ModelFamilyIdentity::Generic);
         assert_eq!(xai_identity, runtime::ModelFamilyIdentity::Generic);
+        assert_eq!(deepseek_identity, runtime::ModelFamilyIdentity::Generic);
     }
 
     #[test]
