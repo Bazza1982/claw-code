@@ -451,12 +451,25 @@ fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
         .output()
         .expect("git init should launch");
 
-    for (command, expected_kind, expected_status) in [
-        ("/version", "version", "ok"),
-        ("/sandbox", "sandbox", "warn"),
-        ("/diff", "diff", "ok"),
-        ("/status", "status", "ok"),
+    for (command, expected_kind) in [
+        ("/version", "version"),
+        ("/sandbox", "sandbox"),
+        ("/diff", "diff"),
+        ("/status", "status"),
     ] {
+        let bare_command = command.trim_start_matches('/');
+        let bare_output = run_claw(&root, &["--output-format", "json", bare_command], &[]);
+        assert!(
+            bare_output.status.success(),
+            "{bare_command} should provide the reference local CliAction, stdout:\n{}\n\nstderr:\n{}",
+            String::from_utf8_lossy(&bare_output.stdout),
+            String::from_utf8_lossy(&bare_output.stderr)
+        );
+        let bare_stdout = String::from_utf8_lossy(&bare_output.stdout);
+        let bare_parsed: Value = serde_json::from_str(bare_stdout.trim()).unwrap_or_else(|_| {
+            panic!("{bare_command} must emit reference JSON (#831), got: {bare_stdout:?}")
+        });
+
         let output = run_claw(&root, &["--output-format", "json", command], &[]);
         assert!(
             output.status.success(),
@@ -471,8 +484,8 @@ fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
 
         assert_eq!(parsed["kind"], expected_kind, "{command} kind: {parsed}");
         assert_eq!(
-            parsed["status"], expected_status,
-            "{command} status: {parsed}"
+            parsed["status"], bare_parsed["status"],
+            "{command} status must match {bare_command}: slash={parsed}, bare={bare_parsed}"
         );
         assert_ne!(
             parsed["error_kind"], "interactive_only",
