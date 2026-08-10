@@ -23,6 +23,10 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    /// Whether the provider may expose tools for this model call. The runtime
+    /// disables tools on the final budgeted iteration so a long-running task
+    /// always gets a chance to return verified partial progress.
+    pub allow_tools: bool,
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -410,18 +414,19 @@ where
         loop {
             iterations += 1;
             if iterations > self.max_iterations {
-                let error = RuntimeError::new(
-                    "conversation loop exceeded the maximum number of iterations",
-                );
+                // The final budgeted iteration is tool-free and must terminate
+                // the loop, so reaching this branch indicates an internal bug.
+                let error = RuntimeError::new("conversation loop exceeded its finalization turn");
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
             }
 
             let mut iteration_system_prompt = self.system_prompt.clone();
+            let is_finalization_iteration = iterations == self.max_iterations;
             if self.max_iterations != usize::MAX {
                 let remaining = self.max_iterations.saturating_sub(iterations);
                 if remaining <= 3 {
-                    iteration_system_prompt.push(if remaining == 0 {
+                    iteration_system_prompt.push(if is_finalization_iteration {
                         "FINAL RESPONSE REQUIRED: The tool-iteration budget is exhausted. Do not call any more tools. Reply now with only verified results, explicitly list anything unfinished or unverified, and name the blocking tool error if one occurred.".to_string()
                     } else {
                         format!(
@@ -433,6 +438,7 @@ where
             let request = ApiRequest {
                 system_prompt: iteration_system_prompt,
                 messages: self.session.messages.clone(),
+                allow_tools: !is_finalization_iteration,
             };
             let events = match self
                 .api_client
@@ -444,7 +450,7 @@ where
                     return Err(error);
                 }
             };
-            let (assistant_message, usage, turn_prompt_cache_events) =
+            let (mut assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
@@ -456,7 +462,7 @@ where
                 self.usage_tracker.record(usage);
             }
             prompt_cache_events.extend(turn_prompt_cache_events);
-            let pending_tool_uses = assistant_message
+            let mut pending_tool_uses = assistant_message
                 .blocks
                 .iter()
                 .filter_map(|block| match block {
@@ -466,6 +472,32 @@ where
                     _ => None,
                 })
                 .collect::<Vec<_>>();
+            if is_finalization_iteration && !pending_tool_uses.is_empty() {
+                let requested_tools = pending_tool_uses
+                    .iter()
+                    .map(|(_, name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                assistant_message
+                    .blocks
+                    .retain(|block| !matches!(block, ContentBlock::ToolUse { .. }));
+                let has_text = assistant_message.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()),
+                );
+                let fallback = if has_text {
+                    format!(
+                        "Tool budget reached; additional tool requests were not executed: {requested_tools}."
+                    )
+                } else {
+                    format!(
+                        "Tool budget reached after {iterations} iterations. Partial progress is preserved in this session. Additional tool requests were not executed: {requested_tools}. Resume the task to continue."
+                    )
+                };
+                assistant_message
+                    .blocks
+                    .push(ContentBlock::Text { text: fallback });
+                pending_tool_uses.clear();
+            }
             self.record_assistant_iteration(
                 iterations,
                 &assistant_message,
@@ -1927,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn run_turn_errors_when_max_iterations_is_exceeded() {
+    fn run_turn_finalizes_without_tools_when_max_iterations_is_reached() {
         struct LoopingApi;
 
         impl ApiClient for LoopingApi {
@@ -1936,12 +1968,9 @@ mod tests {
                     .system_prompt
                     .iter()
                     .any(|part| part.contains("FINAL RESPONSE REQUIRED")));
+                assert!(!request.allow_tools);
                 Ok(vec![
-                    AssistantEvent::ToolUse {
-                        id: "tool-1".to_string(),
-                        name: "echo".to_string(),
-                        input: "payload".to_string(),
-                    },
+                    AssistantEvent::TextDelta("partial result".to_string()),
                     AssistantEvent::MessageStop,
                 ])
             }
@@ -1958,14 +1987,55 @@ mod tests {
         .with_max_iterations(1);
 
         // when
-        let error = runtime
+        let summary = runtime
             .run_turn("loop", None)
-            .expect_err("conversation loop should stop after the configured limit");
+            .expect("conversation loop should finalize at the configured limit");
 
         // then
-        assert!(error
-            .to_string()
-            .contains("conversation loop exceeded the maximum number of iterations"));
+        assert_eq!(summary.iterations, 1);
+        assert!(summary.tool_results.is_empty());
+        assert!(matches!(
+            summary.assistant_messages[0].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "partial result"
+        ));
+    }
+
+    #[test]
+    fn run_turn_does_not_execute_hallucinated_tool_on_finalization_iteration() {
+        struct LoopingApi;
+
+        impl ApiClient for LoopingApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(!request.allow_tools);
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "echo".to_string(),
+                        input: "payload".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LoopingApi,
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(1);
+
+        let summary = runtime
+            .run_turn("loop", None)
+            .expect("finalization should preserve partial progress");
+
+        assert!(summary.tool_results.is_empty());
+        assert!(matches!(
+            summary.assistant_messages[0].blocks.last(),
+            Some(ContentBlock::Text { text }) if text.contains("Additional tool requests were not executed: echo")
+        ));
     }
 
     #[test]

@@ -5200,7 +5200,8 @@ impl ApiClient for ProviderRuntimeClient {
         let messages = convert_messages(&request.messages);
         let system =
             (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
-        let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
+        let tool_choice =
+            (request.allow_tools && !self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
         let chain = &self.chain;
@@ -5211,7 +5212,7 @@ impl ApiClient for ProviderRuntimeClient {
                 max_tokens: max_tokens_for_model(&entry.model),
                 messages: messages.clone(),
                 system: system.clone(),
-                tools: (!tools.is_empty()).then(|| tools.clone()),
+                tools: (request.allow_tools && !tools.is_empty()).then(|| tools.clone()),
                 tool_choice: tool_choice.clone(),
                 stream: true,
                 ..Default::default()

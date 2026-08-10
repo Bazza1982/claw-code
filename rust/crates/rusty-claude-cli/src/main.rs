@@ -7252,7 +7252,18 @@ struct LiveCli {
     prompt_history: Vec<PromptHistoryEntry>,
 }
 
-const DEFAULT_CLI_MAX_ITERATIONS: usize = 32;
+const DEFAULT_CLI_MAX_ITERATIONS: usize = 96;
+const MIN_CLI_MAX_ITERATIONS: usize = 8;
+const MAX_CLI_MAX_ITERATIONS: usize = 512;
+
+fn cli_max_iterations() -> usize {
+    std::env::var("CLAW_MAX_TOOL_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map_or(DEFAULT_CLI_MAX_ITERATIONS, |value| {
+            value.clamp(MIN_CLI_MAX_ITERATIONS, MAX_CLI_MAX_ITERATIONS)
+        })
+}
 
 #[derive(Debug, Clone)]
 struct PromptHistoryEntry {
@@ -12635,7 +12646,7 @@ fn build_runtime_with_plugin_state(
         system_prompt,
         &feature_config,
     )
-    .with_max_iterations(DEFAULT_CLI_MAX_ITERATIONS);
+    .with_max_iterations(cli_max_iterations());
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -12853,10 +12864,9 @@ impl AnthropicRuntimeClient {
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
+            tools: (self.enable_tools && request.allow_tools)
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            tool_choice: (self.enable_tools && request.allow_tools).then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
