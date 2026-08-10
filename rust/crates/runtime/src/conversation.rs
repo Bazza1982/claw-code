@@ -895,6 +895,16 @@ where
                 }
             };
             prompt_cache_events.extend(checkpoint_cache_events);
+            // The independent max planning review can require several slow model
+            // round trips. Publish the already validated acknowledgement before
+            // that review so the user is not left with a silent task. Tools still
+            // remain blocked until the independent planning gate passes.
+            self.record_task_acknowledgement(&frame);
+            if let Some(observer) = observer.as_deref_mut() {
+                observer(RuntimeStreamEvent::TaskAcknowledgement {
+                    text: frame.acknowledgement.clone(),
+                });
+            }
             if self.max_independent_review_enabled {
                 let mut revision_round = 0;
                 loop {
@@ -946,12 +956,8 @@ where
                     }
                 }
             }
-            self.record_task_acknowledgement(&frame);
             self.record_task_plan("initial", &frame);
             if let Some(observer) = observer.as_deref_mut() {
-                observer(RuntimeStreamEvent::TaskAcknowledgement {
-                    text: frame.acknowledgement.clone(),
-                });
                 observer(RuntimeStreamEvent::TaskPlan {
                     phase: "initial".to_string(),
                     frame: frame.clone(),
@@ -3962,6 +3968,23 @@ mod tests {
         assert_eq!(runtime.api_client_mut().planning_reviews, 2);
         assert_eq!(runtime.api_client_mut().evidence_reviews, 2);
         assert_eq!(runtime.api_client_mut().claim_reviews, 2);
+        let acknowledgement_index = observed
+            .iter()
+            .position(|event| matches!(event, RuntimeStreamEvent::TaskAcknowledgement { .. }))
+            .expect("validated acknowledgement should be visible");
+        let planning_review_index = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    RuntimeStreamEvent::IndependentReview { gate, .. } if gate == "planning"
+                )
+            })
+            .expect("planning review should run");
+        assert!(
+            acknowledgement_index < planning_review_index,
+            "max planning review must not delay the visible acknowledgement"
+        );
         assert_eq!(
             observed
                 .iter()
