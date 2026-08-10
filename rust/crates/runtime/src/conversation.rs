@@ -944,12 +944,29 @@ where
                             }
                             revision_round += 1;
                             let reason = independent_review_feedback("planning", &review);
-                            let (revised, replan_cache_events) = self.run_task_checkpoint(
+                            let mut revised_checkpoint = self.run_task_checkpoint(
                                 &authoritative_goal,
                                 presentation_context.as_deref(),
                                 Some(&frame),
                                 Some(&reason),
-                            )?;
+                            );
+                            if let Err(first_error) = &revised_checkpoint {
+                                let recovery_reason = format!(
+                                    "{reason}\n\nTASK FRAME FORMAT RECOVERY: The previous revision response was invalid ({first_error}). Return exactly one complete TaskFrame JSON object that preserves the authoritative goal and boundaries while applying the evaluator's required changes. Do not return prose, markdown, a review verdict, or a partial patch."
+                                );
+                                revised_checkpoint = self.run_task_checkpoint(
+                                    &authoritative_goal,
+                                    presentation_context.as_deref(),
+                                    Some(&frame),
+                                    Some(&recovery_reason),
+                                );
+                            }
+                            let (revised, replan_cache_events) =
+                                revised_checkpoint.map_err(|error| {
+                                    RuntimeError::new(format!(
+                                        "max planning revision could not produce a valid task frame after format recovery; execution stopped before tools: {error}"
+                                    ))
+                                })?;
                             prompt_cache_events.extend(replan_cache_events);
                             frame = revised;
                         }
@@ -3886,6 +3903,7 @@ mod tests {
     fn max_effort_runs_independent_plan_evidence_and_claim_revision_gates() {
         struct MaxReviewApi {
             planning_reviews: usize,
+            planning_replans: usize,
             evidence_reviews: usize,
             claim_reviews: usize,
             execution_calls: usize,
@@ -3949,6 +3967,17 @@ mod tests {
                         .system_prompt
                         .iter()
                         .any(|part| part.contains("add an author-specific negative-path check"));
+                    if revised {
+                        self.planning_replans += 1;
+                        if self.planning_replans == 1 {
+                            return Ok(vec![
+                                AssistantEvent::TextDelta(
+                                    "I revised the verification plan as requested.".to_string(),
+                                ),
+                                AssistantEvent::MessageStop,
+                            ]);
+                        }
+                    }
                     let validation = if revised {
                         r#"["run author-specific verification","run author-specific negative-path check"]"#
                     } else {
@@ -3998,6 +4027,7 @@ mod tests {
             Session::new(),
             MaxReviewApi {
                 planning_reviews: 0,
+                planning_replans: 0,
                 evidence_reviews: 0,
                 claim_reviews: 0,
                 execution_calls: 0,
@@ -4033,6 +4063,7 @@ mod tests {
             "The first check failed; the corrective author-specific rerun passed."
         );
         assert_eq!(runtime.api_client_mut().planning_reviews, 2);
+        assert_eq!(runtime.api_client_mut().planning_replans, 2);
         assert_eq!(runtime.api_client_mut().evidence_reviews, 2);
         assert_eq!(runtime.api_client_mut().claim_reviews, 2);
         let acknowledgement_index = observed
