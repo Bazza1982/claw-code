@@ -33,6 +33,69 @@ pub struct CompactionResult {
     pub removed_message_count: usize,
 }
 
+/// Returns the historical prefix that may be summarized while preserving the
+/// current user turn verbatim. An existing compacted summary is included so a
+/// later semantic compaction cannot accidentally discard older durable context.
+/// The caller supplies the message index where the protected turn begins.
+#[must_use]
+pub fn compactable_history_before(
+    session: &Session,
+    protected_from: usize,
+) -> Vec<ConversationMessage> {
+    let end = protected_from.min(session.messages.len());
+    if end == 0 {
+        return Vec::new();
+    }
+    session.messages[..end].to_vec()
+}
+
+/// Applies a model-produced semantic summary to historical messages while
+/// preserving the current user turn verbatim. This deliberately does not
+/// perform another lossy mechanical summary: the supplied summary has already
+/// passed the caller's schema validation.
+#[must_use]
+pub fn compact_session_with_semantic_summary(
+    session: &Session,
+    protected_from: usize,
+    semantic_summary: &str,
+) -> CompactionResult {
+    let existing_summary = session
+        .messages
+        .first()
+        .and_then(extract_existing_compacted_summary);
+    let start = usize::from(existing_summary.is_some());
+    let end = protected_from.min(session.messages.len());
+    if end <= start || semantic_summary.trim().is_empty() {
+        return CompactionResult {
+            summary: String::new(),
+            formatted_summary: String::new(),
+            compacted_session: session.clone(),
+            removed_message_count: 0,
+        };
+    }
+
+    let summary = format!("<summary>\n{}\n</summary>", semantic_summary.trim());
+    let formatted_summary = format_compact_summary(&summary);
+    let preserved = session.messages[end..].to_vec();
+    let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
+    let mut compacted_messages = vec![ConversationMessage {
+        role: MessageRole::System,
+        blocks: vec![ContentBlock::Text { text: continuation }],
+        usage: None,
+    }];
+    compacted_messages.extend(preserved);
+
+    let mut compacted_session = session.clone();
+    compacted_session.messages = compacted_messages;
+    compacted_session.record_compaction(summary.clone(), end - start);
+    CompactionResult {
+        summary,
+        formatted_summary,
+        compacted_session,
+        removed_message_count: end - start,
+    }
+}
+
 /// Roughly estimates the token footprint of the current session transcript.
 #[must_use]
 pub fn estimate_session_tokens(session: &Session) -> usize {

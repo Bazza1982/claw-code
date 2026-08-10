@@ -8166,6 +8166,7 @@ impl LiveCli {
                 "session_id": self.session.id,
                 "completion_status": summary.completion_status.as_str(),
                 "stop_reason": summary.stop_reason.as_str(),
+                "provider_stop_reason": summary.provider_stop_reason,
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -8194,6 +8195,7 @@ impl LiveCli {
                 "iterations": summary.iterations,
                 "completion_status": summary.completion_status.as_str(),
                 "stop_reason": summary.stop_reason.as_str(),
+                "provider_stop_reason": summary.provider_stop_reason,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),
@@ -8251,6 +8253,7 @@ impl LiveCli {
                 "iterations": summary.iterations,
                 "completion_status": summary.completion_status.as_str(),
                 "stop_reason": summary.stop_reason.as_str(),
+                "provider_stop_reason": summary.provider_stop_reason,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),
@@ -12895,6 +12898,7 @@ impl AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let request_timeout = request.timeout;
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
@@ -12909,6 +12913,7 @@ impl AnthropicRuntimeClient {
         };
 
         self.runtime.block_on(async {
+            let deadline = request_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
             // When resuming after tool execution, apply a stall timeout on the
             // first stream event.  If the model does not respond within the
             // deadline we drop the stalled connection and re-send the request as
@@ -12916,13 +12921,22 @@ impl AnthropicRuntimeClient {
             let max_attempts: usize = if is_post_tool { 2 } else { 1 };
 
             for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(
-                        &message_request,
-                        is_post_tool && attempt == 1,
-                        observer.as_deref_mut(),
-                    )
-                    .await;
+                let operation = self.consume_stream(
+                    &message_request,
+                    is_post_tool && attempt == 1,
+                    observer.as_deref_mut(),
+                );
+                let result = if let Some(deadline) = deadline {
+                    match tokio::time::timeout_at(deadline, operation).await {
+                        Ok(result) => result,
+                        Err(_) => Err(RuntimeError::new(format!(
+                            "provider call exceeded hard timeout of {} seconds",
+                            request_timeout.map_or(0, |timeout| timeout.as_secs())
+                        ))),
+                    }
+                } else {
+                    operation.await
+                };
                 match result {
                     Ok(events) => return Ok(events),
                     Err(error)
@@ -13130,6 +13144,13 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
+                    if let Some(reason) = delta.delta.stop_reason.clone() {
+                        let stop_event = AssistantEvent::ProviderStopReason(reason);
+                        if let Some(observer) = observer.as_deref_mut() {
+                            observer(RuntimeStreamEvent::Assistant(stop_event.clone()));
+                        }
+                        events.push(stop_event);
+                    }
                     let event = AssistantEvent::Usage(delta.usage.token_usage());
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::Assistant(event.clone()));
@@ -13418,6 +13439,10 @@ fn runtime_stream_event_json(event: RuntimeStreamEvent) -> serde_json::Value {
             "current_cache_read_input_tokens": event.current_cache_read_input_tokens,
             "token_drop": event.token_drop,
         }),
+        RuntimeStreamEvent::Assistant(AssistantEvent::ProviderStopReason(reason)) => json!({
+            "kind": "provider_stop_reason",
+            "reason": reason,
+        }),
         RuntimeStreamEvent::Assistant(AssistantEvent::MessageStop) => json!({
             "kind": "message_stop",
         }),
@@ -13507,6 +13532,28 @@ fn runtime_stream_event_json(event: RuntimeStreamEvent) -> serde_json::Value {
             "tool_name": tool_name,
             "reason": reason,
             "summary": format!("Plan telemetry: {tool_name} was not named in the current task plan"),
+        }),
+        RuntimeStreamEvent::SemanticCompaction {
+            status,
+            removed_message_count,
+            reason,
+            timeout_seconds,
+        } => json!({
+            "kind": "semantic_compaction",
+            "status": status,
+            "removed_message_count": removed_message_count,
+            "reason": reason,
+            "timeout_seconds": timeout_seconds,
+        }),
+        RuntimeStreamEvent::TerminalDiagnostic {
+            classification,
+            action,
+            provider_stop_reason,
+        } => json!({
+            "kind": "terminal_diagnostic",
+            "classification": classification,
+            "action": action,
+            "provider_stop_reason": provider_stop_reason,
         }),
     }
 }
