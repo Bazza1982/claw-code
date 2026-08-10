@@ -483,6 +483,8 @@ fn assert_streaming_text(_: &HarnessWorkspace, run: &ScenarioRun) {
         Value::String("Mock streaming says hello from the parity harness.".to_string())
     );
     assert_eq!(run.response["iterations"], Value::from(1));
+    assert_eq!(run.response["completion_status"], Value::from("completed"));
+    assert_eq!(run.response["stop_reason"], Value::from("end_turn"));
     assert_eq!(run.response["tool_uses"], Value::Array(Vec::new()));
     assert_eq!(run.response["tool_results"], Value::Array(Vec::new()));
 }

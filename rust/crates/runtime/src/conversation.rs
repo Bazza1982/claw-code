@@ -166,8 +166,45 @@ pub struct TurnSummary {
     pub tool_results: Vec<ConversationMessage>,
     pub prompt_cache_events: Vec<PromptCacheEvent>,
     pub iterations: usize,
+    pub completion_status: CompletionStatus,
+    pub stop_reason: TurnStopReason,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+}
+
+/// Whether a turn reached a normal model stop or preserved unfinished work at
+/// an execution-budget boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionStatus {
+    Completed,
+    Incomplete,
+}
+
+impl CompletionStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// Machine-readable reason why a successful runtime turn stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnStopReason {
+    EndTurn,
+    MaxIterations,
+}
+
+impl TurnStopReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::MaxIterations => "max_iterations",
+        }
+    }
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -406,10 +443,11 @@ where
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
         let mut assistant_messages = Vec::new();
-        let mut tool_results = Vec::new();
+        let mut tool_results: Vec<ConversationMessage> = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut auto_compaction = None;
+        let mut reached_execution_budget = false;
 
         loop {
             iterations += 1;
@@ -427,7 +465,7 @@ where
                 let remaining = self.max_iterations.saturating_sub(iterations);
                 if remaining <= 3 {
                     iteration_system_prompt.push(if is_finalization_iteration {
-                        "FINAL RESPONSE REQUIRED: The tool-iteration budget is exhausted. Do not call any more tools. Reply now with only verified results, explicitly list anything unfinished or unverified, and name the blocking tool error if one occurred.".to_string()
+                        "FINALIZATION MODE: The execution budget is exhausted and tools are disabled. Do not continue the task or request more tools. Return a concise progress report with exactly these sections: Completed and verified; Unfinished or unverified; Stop reason; Recommended next step. Never claim completion merely because the budget ended. Recommend CONTINUE only when another execution segment is likely to make progress, PIVOT when the current route is repeating or failing, and USER INPUT when a decision or authority is required.".to_string()
                     } else {
                         format!(
                             "Tool budget warning: only {remaining} tool-loop iterations remain. Stop repeating calls, verify the current evidence, and finish with a concise answer. If the task is incomplete, report verified partial results and the exact blocker."
@@ -440,6 +478,9 @@ where
                 messages: self.session.messages.clone(),
                 allow_tools: !is_finalization_iteration,
             };
+            if is_finalization_iteration {
+                reached_execution_budget = true;
+            }
             let events = match self
                 .api_client
                 .stream_observed(request, observer.as_deref_mut())
@@ -484,13 +525,33 @@ where
                 let has_text = assistant_message.blocks.iter().any(
                     |block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()),
                 );
+                let successful_tool_results = tool_results
+                    .iter()
+                    .flat_map(|message| message.blocks.iter())
+                    .filter(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::ToolResult {
+                                is_error: false,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                let failed_tool_results = tool_results
+                    .iter()
+                    .flat_map(|message| message.blocks.iter())
+                    .filter(|block| {
+                        matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+                    })
+                    .count();
                 let fallback = if has_text {
                     format!(
-                        "Tool budget reached; additional tool requests were not executed: {requested_tools}."
+                        "\n\nExecution status: INCOMPLETE. Stop reason: max_iterations. Additional tool requests were not executed: {requested_tools}. Tool execution ledger: {successful_tool_results} successful result(s), {failed_tool_results} failed result(s). Recommended next step: resume to continue or pivot if the same route is repeating."
                     )
                 } else {
                     format!(
-                        "Tool budget reached after {iterations} iterations. Partial progress is preserved in this session. Additional tool requests were not executed: {requested_tools}. Resume the task to continue."
+                        "Execution status: INCOMPLETE. Stop reason: max_iterations after {iterations} iterations. Partial progress is preserved in this session. Additional tool requests were not executed: {requested_tools}. Tool execution ledger: {successful_tool_results} successful result(s), {failed_tool_results} failed result(s). Recommended next step: resume to continue or pivot if the same route is repeating."
                     )
                 };
                 assistant_message
@@ -651,6 +712,16 @@ where
             tool_results,
             prompt_cache_events,
             iterations,
+            completion_status: if reached_execution_budget {
+                CompletionStatus::Incomplete
+            } else {
+                CompletionStatus::Completed
+            },
+            stop_reason: if reached_execution_budget {
+                TurnStopReason::MaxIterations
+            } else {
+                TurnStopReason::EndTurn
+            },
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
         };
@@ -978,9 +1049,9 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        RuntimeStreamEvent, StaticToolExecutor, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        AssistantEvent, AutoCompactionEvent, CompletionStatus, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, RuntimeStreamEvent, StaticToolExecutor, ToolExecutor,
+        TurnStopReason, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1108,6 +1179,8 @@ mod tests {
             .expect("conversation loop should succeed");
 
         assert_eq!(summary.iterations, 2);
+        assert_eq!(summary.completion_status, CompletionStatus::Completed);
+        assert_eq!(summary.stop_reason, TurnStopReason::EndTurn);
         assert_eq!(summary.assistant_messages.len(), 2);
         assert_eq!(summary.tool_results.len(), 1);
         assert_eq!(summary.prompt_cache_events.len(), 1);
@@ -1967,7 +2040,7 @@ mod tests {
                 assert!(request
                     .system_prompt
                     .iter()
-                    .any(|part| part.contains("FINAL RESPONSE REQUIRED")));
+                    .any(|part| part.contains("FINALIZATION MODE")));
                 assert!(!request.allow_tools);
                 Ok(vec![
                     AssistantEvent::TextDelta("partial result".to_string()),
@@ -1993,6 +2066,8 @@ mod tests {
 
         // then
         assert_eq!(summary.iterations, 1);
+        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
+        assert_eq!(summary.stop_reason, TurnStopReason::MaxIterations);
         assert!(summary.tool_results.is_empty());
         assert!(matches!(
             summary.assistant_messages[0].blocks.as_slice(),
@@ -2031,11 +2106,79 @@ mod tests {
             .run_turn("loop", None)
             .expect("finalization should preserve partial progress");
 
+        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
+        assert_eq!(summary.stop_reason, TurnStopReason::MaxIterations);
         assert!(summary.tool_results.is_empty());
         assert!(matches!(
             summary.assistant_messages[0].blocks.last(),
-            Some(ContentBlock::Text { text }) if text.contains("Additional tool requests were not executed: echo")
+            Some(ContentBlock::Text { text }) if text.contains("Execution status: INCOMPLETE")
+                && text.contains("Additional tool requests were not executed: echo")
         ));
+    }
+
+    #[test]
+    fn finalization_fallback_reports_the_tool_execution_ledger() {
+        struct BudgetApi {
+            calls: usize,
+        }
+
+        impl ApiClient for BudgetApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    assert!(request.allow_tools);
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "ok-1".to_string(),
+                            name: "ok".to_string(),
+                            input: "payload".to_string(),
+                        },
+                        AssistantEvent::ToolUse {
+                            id: "fail-1".to_string(),
+                            name: "fail".to_string(),
+                            input: "payload".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                assert!(!request.allow_tools);
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "blocked-1".to_string(),
+                        name: "ok".to_string(),
+                        input: "again".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            BudgetApi { calls: 0 },
+            StaticToolExecutor::new()
+                .register("ok", |_input| Ok("done".to_string()))
+                .register("fail", |_input| Err(ToolError::new("failed"))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(2);
+
+        let summary = runtime
+            .run_turn("loop", None)
+            .expect("budget finalization should return partial progress");
+        let final_text = summary
+            .assistant_messages
+            .last()
+            .and_then(|message| message.blocks.last())
+            .and_then(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("fallback report should be present");
+
+        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
+        assert!(final_text.contains("1 successful result(s), 1 failed result(s)"));
     }
 
     #[test]

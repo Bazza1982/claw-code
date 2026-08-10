@@ -8137,6 +8137,8 @@ impl LiveCli {
                 "compact": true,
                 "model": self.model,
                 "session_id": self.session.id,
+                "completion_status": summary.completion_status.as_str(),
+                "stop_reason": summary.stop_reason.as_str(),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -8163,6 +8165,8 @@ impl LiveCli {
                 "model": self.model,
                 "session_id": self.session.id,
                 "iterations": summary.iterations,
+                "completion_status": summary.completion_status.as_str(),
+                "stop_reason": summary.stop_reason.as_str(),
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),
@@ -8218,6 +8222,8 @@ impl LiveCli {
                 "model": self.model,
                 "session_id": self.session.id,
                 "iterations": summary.iterations,
+                "completion_status": summary.completion_status.as_str(),
+                "stop_reason": summary.stop_reason.as_str(),
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),
