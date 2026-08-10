@@ -417,8 +417,21 @@ where
                 return Err(error);
             }
 
+            let mut iteration_system_prompt = self.system_prompt.clone();
+            if self.max_iterations != usize::MAX {
+                let remaining = self.max_iterations.saturating_sub(iterations);
+                if remaining <= 3 {
+                    iteration_system_prompt.push(if remaining == 0 {
+                        "FINAL RESPONSE REQUIRED: The tool-iteration budget is exhausted. Do not call any more tools. Reply now with only verified results, explicitly list anything unfinished or unverified, and name the blocking tool error if one occurred.".to_string()
+                    } else {
+                        format!(
+                            "Tool budget warning: only {remaining} tool-loop iterations remain. Stop repeating calls, verify the current evidence, and finish with a concise answer. If the task is incomplete, report verified partial results and the exact blocker."
+                        )
+                    });
+                }
+            }
             let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
+                system_prompt: iteration_system_prompt,
                 messages: self.session.messages.clone(),
             };
             let events = match self
@@ -1918,10 +1931,11 @@ mod tests {
         struct LoopingApi;
 
         impl ApiClient for LoopingApi {
-            fn stream(
-                &mut self,
-                _request: ApiRequest,
-            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("FINAL RESPONSE REQUIRED")));
                 Ok(vec![
                     AssistantEvent::ToolUse {
                         id: "tool-1".to_string(),
