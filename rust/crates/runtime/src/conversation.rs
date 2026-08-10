@@ -633,6 +633,7 @@ where
         } else {
             validate_initial_task_frame(&frame)?;
             if self.task_assurance_enabled {
+                apply_runtime_assurance_defaults(&mut frame, self.effective_finalization_reserve());
                 validate_assurance_task_frame(&frame, self.effective_finalization_reserve())?;
             }
         }
@@ -717,12 +718,21 @@ where
         let mut finalization_reserve_started = false;
         let mut last_goal_reanchor_tool_result_count = 0;
         let mut task_frame = if self.task_planning_enabled {
-            let (frame, checkpoint_cache_events) = match self.run_task_checkpoint(
+            let mut checkpoint = self.run_task_checkpoint(
                 &authoritative_goal,
                 presentation_context.as_deref(),
                 None,
                 None,
-            ) {
+            );
+            if checkpoint.is_err() && self.task_assurance_enabled {
+                checkpoint = self.run_task_checkpoint(
+                    &authoritative_goal,
+                    presentation_context.as_deref(),
+                    None,
+                    None,
+                );
+            }
+            let (frame, checkpoint_cache_events) = match checkpoint {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => {
                     self.record_turn_failed(0, &error);
@@ -1724,26 +1734,61 @@ fn validate_assurance_task_frame(
             "high-effort task checkpoint omitted its assurance plan; execution stopped before tools",
         ));
     };
+    let mut missing = Vec::new();
     if assurance
         .review_strategy
         .iter()
         .all(|item| item.trim().is_empty())
-        || !(1..=24).contains(&assurance.review_interval_tool_results)
-        || assurance
-            .review_triggers
-            .iter()
-            .all(|item| item.trim().is_empty())
-        || assurance
-            .validation_strategy
-            .iter()
-            .all(|item| item.trim().is_empty())
-        || assurance.finalization_reserve != expected_finalization_reserve
     {
+        missing.push("review_strategy");
+    }
+    if !(1..=24).contains(&assurance.review_interval_tool_results) {
+        missing.push("review_interval_tool_results");
+    }
+    if assurance
+        .review_triggers
+        .iter()
+        .all(|item| item.trim().is_empty())
+    {
+        missing.push("review_triggers");
+    }
+    if assurance
+        .validation_strategy
+        .iter()
+        .all(|item| item.trim().is_empty())
+    {
+        missing.push("validation_strategy");
+    }
+    if assurance.finalization_reserve != expected_finalization_reserve {
+        missing.push("finalization_reserve");
+    }
+    if !missing.is_empty() {
         return Err(RuntimeError::new(
-            "high-effort task checkpoint omitted its review, validation, risk-trigger, or finalization-reserve strategy; execution stopped before tools",
+            format!(
+                "high-effort task checkpoint omitted or invalidated required assurance fields ({}); execution stopped before tools",
+                missing.join(", ")
+            ),
         ));
     }
     Ok(())
+}
+
+fn apply_runtime_assurance_defaults(frame: &mut TaskFrame, finalization_reserve: usize) {
+    let Some(assurance) = frame.assurance.as_deref_mut() else {
+        return;
+    };
+    if assurance
+        .review_triggers
+        .iter()
+        .all(|item| item.trim().is_empty())
+    {
+        assurance.review_triggers = vec![
+            "tool failure or permission denial".to_string(),
+            "unplanned tool or execution-scope change".to_string(),
+            "semantic compaction or invalidated context".to_string(),
+        ];
+    }
+    assurance.finalization_reserve = finalization_reserve;
 }
 
 fn preserve_assurance_boundaries(frame: &mut TaskFrame, previous: &TaskFrame) {
@@ -3342,7 +3387,55 @@ mod tests {
             .expect_err("high effort must require review and validation strategies");
         assert!(error
             .to_string()
-            .contains("high-effort task checkpoint omitted"));
+            .contains("high-effort task checkpoint omitted its assurance plan"));
+    }
+
+    #[test]
+    fn high_effort_retries_an_invalid_initial_assurance_frame_once() {
+        struct RetryAssuranceApi {
+            calls: usize,
+        }
+
+        impl ApiClient for RetryAssuranceApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("not valid JSON".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if !request.allow_tools {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            r#"{"acknowledgement":"I will inspect and validate the requested state before answering.","active_goal":"inspect state","success_criteria":["verified answer"],"planned_actions":["inspect","validate"],"planned_tools":[],"do_not_do":["do not mutate"],"assurance":{"review_strategy":["review before answering"],"review_interval_tool_results":6,"review_triggers":[],"validation_strategy":["cross-check available evidence"],"finalization_reserve":999,"critical_review_findings":[],"validation_evidence":[],"unverified_items":[]},"completed":[],"remaining_work":["inspect"],"failures":[],"next_action":"inspect"}"#.to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("Verified answer.".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            RetryAssuranceApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_task_planning_enabled(true)
+        .with_task_assurance(true, 2)
+        .with_max_iterations(10);
+
+        let summary = runtime
+            .run_turn("inspect state", None)
+            .expect("the second valid assurance frame should start execution");
+        assert_eq!(summary.completion_status, CompletionStatus::Completed);
+        assert_eq!(runtime.api_client_mut().calls, 3);
     }
 
     #[test]
