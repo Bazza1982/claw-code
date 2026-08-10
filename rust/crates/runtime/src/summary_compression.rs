@@ -188,6 +188,8 @@ fn is_core_detail(line: &str) -> bool {
         "- Scope:",
         "- Current work:",
         "- Pending work:",
+        "- Work active when summarized (historical):",
+        "- Previously unfinished work (historical; not automatically queued):",
         "- Key files referenced:",
         "- Tools mentioned:",
         "- Recent user requests:",

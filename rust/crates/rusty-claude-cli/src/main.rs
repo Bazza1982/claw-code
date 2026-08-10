@@ -7265,6 +7265,19 @@ fn cli_max_iterations() -> usize {
         })
 }
 
+fn cli_auto_compaction_threshold(model: &str) -> u32 {
+    runtime::auto_compaction_threshold_override_from_env()
+        .unwrap_or_else(|| model_auto_compaction_threshold(model))
+}
+
+fn model_auto_compaction_threshold(model: &str) -> u32 {
+    let context_window = api::model_token_limit(model).map_or(
+        runtime::DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+        |limit| limit.context_window_tokens,
+    );
+    runtime::auto_compaction_threshold_for_context_window(context_window)
+}
+
 #[derive(Debug, Clone)]
 struct PromptHistoryEntry {
     timestamp_ms: u64,
@@ -7959,8 +7972,8 @@ impl LiveCli {
                     // If the error tells us the server's actual context window, adapt our
                     // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
-                        // Set threshold at 70% of the reported window to leave headroom.
-                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
+                        let threshold =
+                            runtime::auto_compaction_threshold_for_context_window(window);
                         println!(
                             "  Server context window: {} tokens — setting auto-compaction threshold to {}",
                             window, threshold
@@ -8067,7 +8080,10 @@ impl LiveCli {
                                     if let Some(window) =
                                         extract_context_window_tokens_from_error(&retry_str)
                                     {
-                                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
+                                        let threshold =
+                                            runtime::auto_compaction_threshold_for_context_window(
+                                                window,
+                                            );
                                         new_runtime
                                             .set_auto_compaction_input_tokens_threshold(threshold);
                                     }
@@ -12618,6 +12634,7 @@ fn build_runtime_with_plugin_state(
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    let auto_compaction_threshold = cli_auto_compaction_threshold(&model);
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
         session.model = Some(model.clone());
@@ -12652,7 +12669,8 @@ fn build_runtime_with_plugin_state(
         system_prompt,
         &feature_config,
     )
-    .with_max_iterations(cli_max_iterations());
+    .with_max_iterations(cli_max_iterations())
+    .with_auto_compaction_input_tokens_threshold(auto_compaction_threshold);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -14698,22 +14716,22 @@ mod tests {
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
-        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
-        SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        merge_prompt_with_stdin, model_auto_compaction_threshold, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_help_topic_json, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage, render_session_list,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitOperation, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PermissionModeProvenance,
+        PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary, SlashCommand,
+        StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -14756,6 +14774,19 @@ mod tests {
             None,
         )])
         .expect("plugin tool registry should build")
+    }
+
+    #[test]
+    fn derives_auto_compaction_threshold_from_model_metadata_with_safe_unknown_default() {
+        assert_eq!(
+            model_auto_compaction_threshold("claude-sonnet-4-6"),
+            160_000
+        );
+        assert_eq!(model_auto_compaction_threshold("gpt-5.4"), 800_000);
+        assert_eq!(
+            model_auto_compaction_threshold("deepseek/deepseek-v4-pro"),
+            160_000
+        );
     }
 
     #[test]
