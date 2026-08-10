@@ -687,8 +687,26 @@ where
                     .saturating_sub(last_goal_reanchor_tool_result_count)
                     >= GOAL_REANCHOR_TOOL_RESULT_INTERVAL;
             if checkpoint_due && self.task_planning_enabled {
-                let (frame, checkpoint_cache_events) =
-                    self.run_task_checkpoint(&authoritative_goal, task_frame.as_ref())?;
+                let checkpoint = self.run_task_checkpoint(&authoritative_goal, task_frame.as_ref());
+                let (frame, checkpoint_cache_events) = match checkpoint {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        // The initial frame has already been shown to the user and
+                        // accepted as the execution boundary. A transient replan
+                        // failure must never replace or broaden it, but it also must
+                        // not discard verified progress made under that frame.
+                        let mut preserved = task_frame.clone().ok_or_else(|| {
+                            RuntimeError::new(
+                                "task replan failed without a preserved initial task frame",
+                            )
+                        })?;
+                        let failure = format!(
+                            "Task replan unavailable; preserved the confirmed task frame: {error}"
+                        );
+                        preserved.failures.push(failure);
+                        (preserved, Vec::new())
+                    }
+                };
                 prompt_cache_events.extend(checkpoint_cache_events);
                 self.record_task_plan("replan", &frame);
                 if let Some(observer) = observer.as_deref_mut() {
@@ -2995,6 +3013,93 @@ mod tests {
             event,
             RuntimeStreamEvent::TaskPlan { frame, .. }
                 if frame.active_goal == "修复 acknowledgement，使其体现 Agent 对当前具体工作的理解"
+        )));
+    }
+
+    #[test]
+    fn invalid_replan_preserves_confirmed_frame_and_continues_execution() {
+        struct InvalidReplanApi {
+            planning_calls: usize,
+            execution_calls: usize,
+        }
+
+        impl ApiClient for InvalidReplanApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if !request.allow_tools {
+                    self.planning_calls += 1;
+                    if self.planning_calls == 1 {
+                        return Ok(vec![
+                            AssistantEvent::TextDelta(
+                                r#"{"acknowledgement":"I will inspect only the latest Momo logs and report any errors without modifying files.","active_goal":"inspect only the latest Momo logs and report errors without modifying files","success_criteria":["report verified errors"],"planned_actions":["read the latest logs","report findings"],"planned_tools":["read"],"do_not_do":["do not modify files"],"completed":[],"remaining_work":["inspect logs"],"failures":[],"next_action":"read the latest log files"}"#.to_string(),
+                            ),
+                            AssistantEvent::MessageStop,
+                        ]);
+                    }
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "I should keep investigating instead of returning JSON.".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+
+                self.execution_calls += 1;
+                if self.execution_calls <= 6 {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: format!("read-{}", self.execution_calls),
+                            name: "read".to_string(),
+                            input: "latest.log".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("No errors found in the latest logs.".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            InvalidReplanApi {
+                planning_calls: 0,
+                execution_calls: 0,
+            },
+            StaticToolExecutor::new().register("read", |_| Ok("clean".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_task_planning_enabled(true)
+        .with_max_iterations(10);
+        let mut observed = Vec::new();
+        let mut observer = |event| observed.push(event);
+
+        let summary = runtime
+            .run_turn_observed(
+                "inspect only the latest Momo logs and report errors without modifying files",
+                None,
+                Some(&mut observer),
+            )
+            .expect("an invalid replan must not abort work under the confirmed frame");
+
+        assert_eq!(runtime.api_client_mut().planning_calls, 2);
+        assert_eq!(runtime.api_client_mut().execution_calls, 7);
+        assert_eq!(summary.tool_results.len(), 6);
+        assert_eq!(
+            super::visible_text(summary.assistant_messages.last().unwrap()),
+            "No errors found in the latest logs."
+        );
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::TaskPlan { phase, frame }
+                if phase == "replan"
+                    && frame.active_goal
+                        == "inspect only the latest Momo logs and report errors without modifying files"
+                    && frame.failures.iter().any(|failure| failure.contains(
+                        "Task replan unavailable; preserved the confirmed task frame"
+                    ))
         )));
     }
 
