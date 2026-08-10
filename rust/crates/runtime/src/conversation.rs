@@ -877,23 +877,45 @@ where
         let mut max_final_claim_revision_round = 0;
         let mut max_critic_blocked_completion = false;
         let mut task_frame = if self.task_planning_enabled {
+            let checkpoint_attempts = if self.max_independent_review_enabled {
+                MAX_TASK_FRAME_FORMAT_ATTEMPTS
+            } else if self.task_assurance_enabled {
+                2
+            } else {
+                1
+            };
             let mut checkpoint = self.run_task_checkpoint(
                 &authoritative_goal,
                 presentation_context.as_deref(),
                 None,
                 None,
             );
-            if checkpoint.is_err() && self.task_assurance_enabled {
+            for format_attempt in 2..=checkpoint_attempts {
+                let Err(previous_error) = &checkpoint else {
+                    break;
+                };
+                let recovery_reason = format!(
+                    "INITIAL TASK FRAME FORMAT RECOVERY ATTEMPT {format_attempt}/{checkpoint_attempts}: The previous response was invalid ({previous_error}). Return exactly one complete TaskFrame JSON object for the authoritative current request. Do not return prose, markdown, bridge metadata, a review verdict, or a partial patch."
+                );
                 checkpoint = self.run_task_checkpoint(
                     &authoritative_goal,
                     presentation_context.as_deref(),
                     None,
-                    None,
+                    Some(&recovery_reason),
                 );
             }
             let (mut frame, checkpoint_cache_events) = match checkpoint {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => {
+                    if self.max_independent_review_enabled {
+                        return self.finish_incomplete_before_tools(
+                            format!(
+                                "Execution status: INCOMPLETE. The max-effort planning checkpoint could not produce a valid task frame after {checkpoint_attempts} format attempts, so no task tools were allowed to run. Unfinished or unverified: the requested work has not started. Stop reason: task-frame format recovery was exhausted ({error}). Recommended next step: retry the request with the same scope; if this repeats, inspect the captured planning responses before changing the task."
+                            ),
+                            prompt_cache_events,
+                            observer.as_deref_mut(),
+                        );
+                    }
                     self.record_turn_failed(0, &error);
                     return Err(error);
                 }
@@ -912,13 +934,16 @@ where
             if self.max_independent_review_enabled {
                 let mut revision_round = 0;
                 loop {
-                    let (review, review_cache_events) = self.run_independent_review(
+                    let (review, review_cache_events) = match self.run_independent_review(
                         "planning",
                         &authoritative_goal,
                         &frame,
                         &[],
                         None,
-                    )?;
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => (failed_independent_review("planning", &error), Vec::new()),
+                    };
                     prompt_cache_events.extend(review_cache_events);
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::IndependentReview {
@@ -930,21 +955,33 @@ where
                     match review.decision {
                         IndependentReviewDecision::Pass => break,
                         IndependentReviewDecision::Block => {
-                            let error = RuntimeError::new(format!(
-                                "max independent planning review blocked execution before tools: {}",
-                                review.summary
-                            ));
-                            self.record_turn_failed(0, &error);
-                            return Err(error);
+                            self.record_task_plan("planning_blocked", &frame);
+                            if let Some(observer) = observer.as_deref_mut() {
+                                observer(RuntimeStreamEvent::TaskPlan {
+                                    phase: "planning_blocked".to_string(),
+                                    frame: frame.clone(),
+                                });
+                            }
+                            return self.finish_incomplete_before_tools(
+                                independent_review_incomplete_report("planning", &review),
+                                prompt_cache_events,
+                                observer.as_deref_mut(),
+                            );
                         }
                         IndependentReviewDecision::Revise => {
                             if revision_round >= MAX_REVIEW_MAX_REVISIONS {
-                                let error = RuntimeError::new(format!(
-                                    "max independent planning review exhausted {MAX_REVIEW_MAX_REVISIONS} revision rounds before tools: {}",
-                                    review.summary
-                                ));
-                                self.record_turn_failed(0, &error);
-                                return Err(error);
+                                self.record_task_plan("planning_revision_exhausted", &frame);
+                                if let Some(observer) = observer.as_deref_mut() {
+                                    observer(RuntimeStreamEvent::TaskPlan {
+                                        phase: "planning_revision_exhausted".to_string(),
+                                        frame: frame.clone(),
+                                    });
+                                }
+                                return self.finish_incomplete_before_tools(
+                                    independent_review_incomplete_report("planning", &review),
+                                    prompt_cache_events,
+                                    observer.as_deref_mut(),
+                                );
                             }
                             revision_round += 1;
                             let reason = independent_review_feedback("planning", &review);
@@ -968,12 +1005,38 @@ where
                                     Some(&recovery_reason),
                                 );
                             }
-                            let (revised, replan_cache_events) =
-                                revised_checkpoint.map_err(|error| {
-                                    RuntimeError::new(format!(
-                                        "max planning revision could not produce a valid task frame after format recovery; execution stopped before tools: {error}"
-                                    ))
-                                })?;
+                            let (revised, replan_cache_events) = match revised_checkpoint {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    let failure = RuntimeError::new(format!(
+                                        "max planning revision could not produce a valid task frame after {MAX_TASK_FRAME_FORMAT_ATTEMPTS} format attempts: {error}"
+                                    ));
+                                    let failed_review =
+                                        failed_independent_review("planning", &failure);
+                                    if let Some(observer) = observer.as_deref_mut() {
+                                        observer(RuntimeStreamEvent::IndependentReview {
+                                            gate: "planning".to_string(),
+                                            revision_round,
+                                            review: failed_review.clone(),
+                                        });
+                                    }
+                                    self.record_task_plan("planning_format_exhausted", &frame);
+                                    if let Some(observer) = observer.as_deref_mut() {
+                                        observer(RuntimeStreamEvent::TaskPlan {
+                                            phase: "planning_format_exhausted".to_string(),
+                                            frame: frame.clone(),
+                                        });
+                                    }
+                                    return self.finish_incomplete_before_tools(
+                                        independent_review_incomplete_report(
+                                            "planning",
+                                            &failed_review,
+                                        ),
+                                        prompt_cache_events,
+                                        observer.as_deref_mut(),
+                                    );
+                                }
+                            };
                             prompt_cache_events.extend(replan_cache_events);
                             frame = revised;
                         }
@@ -1929,6 +1992,39 @@ where
         session_tracer.record("turn_completed", attributes);
     }
 
+    fn finish_incomplete_before_tools(
+        &mut self,
+        text: String,
+        prompt_cache_events: Vec<PromptCacheEvent>,
+        observer: Option<&mut RuntimeStreamObserver<'_>>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        let assistant_message =
+            ConversationMessage::assistant(vec![ContentBlock::Text { text: text.clone() }]);
+        self.record_assistant_iteration(0, &assistant_message, 0);
+        self.session
+            .push_message(assistant_message.clone())
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Some(observer) = observer {
+            observer(RuntimeStreamEvent::Assistant(AssistantEvent::TextDelta(
+                text,
+            )));
+            observer(RuntimeStreamEvent::Assistant(AssistantEvent::MessageStop));
+        }
+        let summary = TurnSummary {
+            assistant_messages: vec![assistant_message],
+            tool_results: Vec::new(),
+            prompt_cache_events,
+            iterations: 0,
+            completion_status: CompletionStatus::Incomplete,
+            stop_reason: TurnStopReason::IndependentReview,
+            provider_stop_reason: None,
+            usage: self.usage_tracker.cumulative_usage(),
+            auto_compaction: None,
+        };
+        self.record_turn_completed(&summary);
+        Ok(summary)
+    }
+
     fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
         let Some(session_tracer) = &self.session_tracer else {
             return;
@@ -2002,18 +2098,8 @@ where
 }
 
 fn parse_independent_review(raw: &str) -> Result<IndependentReview, String> {
-    let trimmed = raw.trim();
-    serde_json::from_str(trimmed)
-        .or_else(|_| {
-            let start = trimmed
-                .find('{')
-                .ok_or_else(|| "missing JSON object".to_string())?;
-            let end = trimmed
-                .rfind('}')
-                .ok_or_else(|| "missing JSON object terminator".to_string())?;
-            serde_json::from_str(&trimmed[start..=end]).map_err(|error| error.to_string())
-        })
-        .map_err(|error| format!("invalid review JSON: {error}"))
+    parse_json_object_matching(raw, |_: &IndependentReview| true)
+        .ok_or_else(|| "invalid review JSON: no complete review object found".to_string())
 }
 
 fn validate_independent_review(review: &IndependentReview) -> Result<(), String> {
@@ -3650,6 +3736,20 @@ mod tests {
     }
 
     #[test]
+    fn independent_review_parser_ignores_unrelated_json_objects() {
+        let raw = r#"
+{"telemetry":{"attempt":1}}
+{"decision":"pass","summary":"The evidence is sufficient.","findings":[],"missing_evidence":[],"required_changes":[],"evidence_refs":["raw tool result 1"]}
+{"memory":{"write":false}}
+"#;
+
+        let review = super::parse_independent_review(raw).expect("review object should parse");
+
+        assert_eq!(review.decision, super::IndependentReviewDecision::Pass);
+        assert_eq!(review.evidence_refs, vec!["raw tool result 1"]);
+    }
+
+    #[test]
     fn build_assistant_message_requires_content() {
         // given
         let events = vec![AssistantEvent::MessageStop];
@@ -4176,6 +4276,113 @@ mod tests {
         );
         assert!(final_text.contains("INCOMPLETE"));
         assert!(!final_text.contains("definitely verified"));
+    }
+
+    #[test]
+    fn max_planning_block_returns_visible_incomplete_result_instead_of_runtime_error() {
+        struct PlanningBlockApi {
+            execution_calls: usize,
+        }
+
+        impl ApiClient for PlanningBlockApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR"))
+                {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(r#"{"decision":"block","summary":"The requested mutation lacks authorization.","findings":[{"severity":"critical","category":"scope","issue":"authorization is missing","evidence":"authoritative goal does not approve mutation","required_change":"obtain user authorization"}],"missing_evidence":["explicit authorization"],"required_changes":["ask the user"],"evidence_refs":["authoritative goal"]}"#.to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if request.allow_tools {
+                    self.execution_calls += 1;
+                    unreachable!("planning block must stop before execution");
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta(r#"{"acknowledgement":"I will review the requested mutation before any tools run.","active_goal":"review requested mutation","success_criteria":["authorization is confirmed"],"planned_actions":["review scope"],"planned_tools":[],"do_not_do":["do not mutate without authorization"],"assurance":{"review_strategy":["review before tools"],"review_interval_tool_results":6,"review_triggers":["missing authorization"],"validation_strategy":["confirm explicit authorization"],"test_strategy":["no behavioral test applies before authorization"],"finalization_reserve":4,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[]},"completed":[],"remaining_work":["confirm authorization"],"failures":[],"next_action":"review scope"}"#.to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            PlanningBlockApi { execution_calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(10)
+        .with_task_assurance(true, 4)
+        .with_max_independent_review(true);
+        let mut observed = Vec::new();
+        let mut observer = |event| observed.push(event);
+
+        let summary = runtime
+            .run_turn_observed("review mutation", None, Some(&mut observer))
+            .expect("planning block should be a semantic incomplete result");
+
+        assert_eq!(runtime.api_client_mut().execution_calls, 0);
+        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
+        assert_eq!(summary.stop_reason, TurnStopReason::IndependentReview);
+        assert!(super::user_visible_text(&summary.assistant_messages[0]).contains("INCOMPLETE"));
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::TaskPlan { phase, .. } if phase == "planning_blocked"
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::Assistant(AssistantEvent::TextDelta(text)) if text.contains("INCOMPLETE")
+        )));
+    }
+
+    #[test]
+    fn max_invalid_planning_review_exhaustion_returns_visible_incomplete_result() {
+        struct InvalidReviewApi {
+            review_calls: usize,
+        }
+
+        impl ApiClient for InvalidReviewApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR"))
+                {
+                    self.review_calls += 1;
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("The plan looks fine.".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta(r#"{"acknowledgement":"I will inspect the requested state without mutation.","active_goal":"inspect state","success_criteria":["state is reported"],"planned_actions":["inspect"],"planned_tools":[],"do_not_do":["do not mutate"],"assurance":{"review_strategy":["review before tools"],"review_interval_tool_results":6,"review_triggers":[],"validation_strategy":["use direct evidence"],"test_strategy":["no behavioral test applies"],"finalization_reserve":4,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[]},"completed":[],"remaining_work":["inspect"],"failures":[],"next_action":"inspect"}"#.to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            InvalidReviewApi { review_calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(10)
+        .with_task_assurance(true, 4)
+        .with_max_independent_review(true);
+
+        let summary = runtime
+            .run_turn("inspect state", None)
+            .expect("invalid critic output should fail closed semantically");
+
+        assert_eq!(runtime.api_client_mut().review_calls, 3);
+        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
+        assert_eq!(summary.stop_reason, TurnStopReason::IndependentReview);
+        assert!(super::user_visible_text(&summary.assistant_messages[0]).contains("INCOMPLETE"));
     }
 
     #[test]
