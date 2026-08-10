@@ -733,7 +733,7 @@ where
             proposed_answer,
         );
         let gate_instruction = match gate {
-            "planning" => "PLANNING GATE: Critique the plan before any task tools run. Test requirement coverage, authorization boundaries, assumptions, verification design, test design, failure criteria, and whether the proposed evidence could actually prove success.",
+            "planning" => "PLANNING GATE: Critique the plan before any task tools run. Test requirement coverage, authorization boundaries, assumptions, verification design, test design, failure criteria, and whether the proposed evidence could actually prove success. At this gate, task-tool evidence is absent by construction. Do not require actual-state, preflight, version, health, test, registry, or other tool-derived evidence as a condition for allowing the tools that would collect it. Treat explicitly planned future evidence collection as remaining work, not as a missing-evidence defect, when the plan names task-matched sources, pass/fail criteria, safety stop conditions, and what must remain unverified if collection fails. Do not require an additional independent observer: the later execution-evidence and final-claim gates provide independent review after tools run. REVISE when the evidence design or safety gates are inadequate; BLOCK only for the reserved authorization, contradiction, or exhausted-safe-route conditions, not merely because planned evidence does not exist yet.",
             "execution_evidence" => "EXECUTION EVIDENCE GATE: Critique the actual verification and testing execution after task activity. Raw tool results outrank the task frame, generated files, and the agent's proposed answer. Check each success criterion and identify failed, skipped, ambiguous, truncated, irrelevant, or non-author-specific evidence.",
             "final_claim" => "FINAL CLAIM GATE: Audit every material completion claim in the proposed user-visible answer against raw evidence. Reject stronger-than-evidence wording, hidden failures, date or count contradictions, fallback presented as primary-path success, and unverified state recorded as verified.",
             _ => "Critically evaluate the supplied task artifacts and raw evidence.",
@@ -3926,6 +3926,12 @@ mod tests {
                         .iter()
                         .any(|part| part.contains("PLANNING GATE"))
                     {
+                        let planning_contract = request.system_prompt.join("\n");
+                        assert!(planning_contract
+                            .contains("task-tool evidence is absent by construction"));
+                        assert!(planning_contract.contains(
+                            "Treat explicitly planned future evidence collection as remaining work"
+                        ));
                         self.planning_reviews += 1;
                         if self.planning_reviews == 1 {
                             r#"{"decision":"revise","summary":"The plan lacks an author-specific negative-path check.","findings":[{"severity":"high","category":"planning","issue":"verification design is too broad","evidence":"validation_strategy only says run verification","required_change":"add an author-specific negative-path check"}],"missing_evidence":[],"required_changes":["add an author-specific negative-path check"],"evidence_refs":["proposed task frame"]}"#
