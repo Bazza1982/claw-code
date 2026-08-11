@@ -7292,14 +7292,6 @@ fn cli_max_plus_enabled() -> bool {
         .is_some_and(|effort| max_plus_for_effort(&effort))
 }
 
-fn cli_max_plus_token_budget() -> u32 {
-    std::env::var("CLAW_MAX_PLUS_TOKEN_BUDGET")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(1_500_000)
-        .clamp(100_000, 5_000_000)
-}
-
 fn cli_max_plus_time_budget() -> Duration {
     Duration::from_secs(
         std::env::var("CLAW_MAX_PLUS_TIME_BUDGET_SECONDS")
@@ -12741,7 +12733,7 @@ fn build_runtime_with_plugin_state(
     .with_task_assurance(task_assurance_enabled, finalization_reserve)
     .with_max_independent_review(cli_max_independent_review_enabled())
     .with_max_plus(cli_max_plus_enabled())
-    .with_max_plus_budgets(cli_max_plus_token_budget(), cli_max_plus_time_budget())
+    .with_max_plus_time_budget(cli_max_plus_time_budget())
     .with_auto_compaction_input_tokens_threshold(auto_compaction_threshold);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
