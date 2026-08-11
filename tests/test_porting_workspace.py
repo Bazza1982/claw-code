@@ -23,6 +23,14 @@ class PortingWorkspaceTests(unittest.TestCase):
         self.assertIn('Python Porting Workspace Summary', summary)
         self.assertIn('Command surface:', summary)
         self.assertIn('Tool surface:', summary)
+        self.assertNotIn('Max budget tokens:', summary)
+
+    def test_query_engine_does_not_stop_on_cumulative_token_usage(self) -> None:
+        engine = QueryEnginePort.from_workspace()
+        result = engine.submit_message('token ' * 2500)
+
+        self.assertEqual('completed', result.stop_reason)
+        self.assertGreater(result.usage.input_tokens, 2000)
 
     def test_cli_summary_runs(self) -> None:
         result = subprocess.run(

@@ -15,7 +15,6 @@ from .transcript import TranscriptStore
 @dataclass(frozen=True)
 class QueryEngineConfig:
     max_turns: int = 8
-    max_budget_tokens: int = 2000
     compact_after_turns: int = 12
     structured_output: bool = False
     structured_retry_limit: int = 2
@@ -86,9 +85,6 @@ class QueryEnginePort:
         ]
         output = self._format_output(summary_lines)
         projected_usage = self.total_usage.add_turn(prompt, output)
-        stop_reason = 'completed'
-        if projected_usage.input_tokens + projected_usage.output_tokens > self.config.max_budget_tokens:
-            stop_reason = 'max_budget_reached'
         self.mutable_messages.append(prompt)
         self.transcript_store.append(prompt)
         self.permission_denials.extend(denied_tools)
@@ -101,7 +97,7 @@ class QueryEnginePort:
             matched_tools=matched_tools,
             permission_denials=denied_tools,
             usage=self.total_usage,
-            stop_reason=stop_reason,
+            stop_reason='completed',
         )
 
     def stream_submit_message(
@@ -194,7 +190,6 @@ class QueryEnginePort:
             f'Permission denials tracked: {len(self.permission_denials)}',
             f'Usage totals: in={self.total_usage.input_tokens} out={self.total_usage.output_tokens}',
             f'Max turns: {self.config.max_turns}',
-            f'Max budget tokens: {self.config.max_budget_tokens}',
             f'Transcript flushed: {self.transcript_store.flushed}',
         ]
         return '\n'.join(sections)

@@ -45,7 +45,6 @@ PASS requires concrete evidence_refs and no unresolved critical/high finding or 
 const MAX_REVIEW_REVISION_PROMPT: &str = "MAX REVIEW FEEDBACK. An independent evaluator identified concerns in the previous plan or proposed completion. Use the feedback to improve the work within the active task scope. The evaluator is advisory: it does not own execution and must not replace the task-performing agent's final answer. Address supported concerns using raw evidence, but reject irrelevant or disproportionate advice. Use tools when necessary and allowed. Never convert missing or failed evidence into a success claim. If evidence cannot be obtained, report the affected item as unverified or incomplete.";
 const MAX_REVIEW_MAX_REVISIONS: usize = 3;
 const MAX_PLUS_REVIEW_MAX_REVISIONS: usize = 5;
-const DEFAULT_MAX_PLUS_TOKEN_BUDGET: u32 = 1_500_000;
 const DEFAULT_MAX_PLUS_TIME_BUDGET: Duration = Duration::from_secs(1_500);
 const MAX_TASK_FRAME_FORMAT_ATTEMPTS: usize = 3;
 const MAX_INDEPENDENT_REVIEW_FORMAT_ATTEMPTS: usize = 3;
@@ -179,7 +178,6 @@ pub struct MaxPlusBudgetSnapshot {
     pub review_revisions_limit: usize,
     pub finalization_reserve: usize,
     pub tokens_used: u32,
-    pub token_limit: u32,
     pub elapsed_seconds: u64,
     pub time_limit_seconds: u64,
 }
@@ -543,7 +541,6 @@ pub struct ConversationRuntime<C, T> {
     task_assurance_enabled: bool,
     max_independent_review_enabled: bool,
     max_plus_enabled: bool,
-    max_plus_token_budget: u32,
     max_plus_time_budget: Duration,
     finalization_reserve: usize,
     pending_control_events: Vec<RuntimeStreamEvent>,
@@ -600,7 +597,6 @@ where
             task_assurance_enabled: false,
             max_independent_review_enabled: false,
             max_plus_enabled: false,
-            max_plus_token_budget: DEFAULT_MAX_PLUS_TOKEN_BUDGET,
             max_plus_time_budget: DEFAULT_MAX_PLUS_TIME_BUDGET,
             finalization_reserve: 0,
             pending_control_events: Vec::new(),
@@ -652,8 +648,7 @@ where
     }
 
     #[must_use]
-    pub fn with_max_plus_budgets(mut self, token_budget: u32, time_budget: Duration) -> Self {
-        self.max_plus_token_budget = token_budget.max(1);
+    pub fn with_max_plus_time_budget(mut self, time_budget: Duration) -> Self {
         self.max_plus_time_budget = time_budget.max(Duration::from_secs(1));
         self
     }
@@ -1092,7 +1087,6 @@ where
             review_revisions_limit: self.effective_review_revision_limit(),
             finalization_reserve: self.effective_finalization_reserve(),
             tokens_used,
-            token_limit: self.max_plus_token_budget,
             elapsed_seconds: elapsed.as_secs(),
             time_limit_seconds: self.max_plus_time_budget.as_secs(),
         }
@@ -1224,7 +1218,7 @@ where
         let mut max_testing_revision_round = 0;
         let mut max_final_claim_revision_round = 0;
         let mut max_agent_owned_finalization_due = false;
-        let mut max_plus_budget_exhausted = false;
+        let mut max_plus_time_budget_exhausted = false;
         let mut task_frame = if self.task_planning_enabled {
             let checkpoint_attempts = if self.max_independent_review_enabled {
                 MAX_TASK_FRAME_FORMAT_ATTEMPTS
@@ -1461,21 +1455,18 @@ where
                 return Err(error);
             }
 
-            if self.max_plus_enabled && !max_plus_budget_exhausted {
+            if self.max_plus_enabled && !max_plus_time_budget_exhausted {
                 let tokens_used = self
                     .usage_tracker
                     .cumulative_usage()
                     .total_tokens()
                     .saturating_sub(max_plus_start_tokens);
-                if tokens_used >= self.max_plus_token_budget
-                    || max_plus_started_at.elapsed() >= self.max_plus_time_budget
-                {
-                    max_plus_budget_exhausted = true;
+                if max_plus_started_at.elapsed() >= self.max_plus_time_budget {
+                    max_plus_time_budget_exhausted = true;
                     reached_execution_budget = true;
                     max_agent_owned_finalization_due = true;
                     max_review_feedback_due = Some(format!(
-                        "MAX+ BUDGET STOP: stop exploration and tool use now. Produce an evidence-bounded final answer. tokens={tokens_used}/{} elapsed_seconds={}/{}.",
-                        self.max_plus_token_budget,
+                        "MAX+ TIME BUDGET STOP: stop exploration and tool use now. Produce an evidence-bounded final answer. tokens_used={tokens_used} elapsed_seconds={}/{}.",
                         max_plus_started_at.elapsed().as_secs(),
                         self.max_plus_time_budget.as_secs(),
                     ));
@@ -2238,7 +2229,7 @@ where
             },
             stop_reason: if terminal_no_final_text {
                 TurnStopReason::NoFinalText
-            } else if max_plus_budget_exhausted {
+            } else if max_plus_time_budget_exhausted {
                 TurnStopReason::BudgetExhausted
             } else if reached_execution_budget {
                 TurnStopReason::MaxIterations
@@ -5112,35 +5103,32 @@ mod tests {
     }
 
     #[test]
-    fn max_plus_token_budget_stops_tools_and_preserves_one_honest_finalization() {
-        struct BudgetApi;
+    fn max_plus_high_token_usage_does_not_stop_the_turn() {
+        struct HighUsageApi;
 
-        impl ApiClient for BudgetApi {
+        impl ApiClient for HighUsageApi {
             fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 let prompts = request.system_prompt.join("\n");
                 if prompts.contains("MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR") {
                     return Ok(vec![
-                        AssistantEvent::TextDelta(r#"{"decision":"pass","summary":"The bounded plan is safe.","findings":[],"missing_evidence":[],"required_changes":[],"evidence_refs":["task frame"]}"#.to_string()),
+                        AssistantEvent::TextDelta(r#"{"decision":"pass","summary":"The high-usage run remains valid.","findings":[],"missing_evidence":[],"required_changes":[],"evidence_refs":["task frame"]}"#.to_string()),
                         AssistantEvent::MessageStop,
                     ]);
                 }
                 if prompts.contains("TASK CONTROL CHECKPOINT") {
                     return Ok(vec![
-                        AssistantEvent::TextDelta(r#"{"acknowledgement":"I will stop safely if the MAX+ budget is exhausted.","active_goal":"exercise token stop","success_criteria":["no tools after budget"],"planned_actions":["inspect"],"planned_tools":["echo"],"do_not_do":["do not exceed budget"],"assurance":{"review_strategy":["review before completion"],"review_interval_tool_results":6,"review_triggers":["budget stop"],"validation_strategy":["inspect raw result"],"test_strategy":["assert no tool call"],"finalization_reserve":16,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[],"hypotheses":[],"discriminations":[],"evidence_updates":[]},"completed":[],"remaining_work":["inspect"],"failures":[],"next_action":"inspect"}"#.to_string()),
+                        AssistantEvent::TextDelta(r#"{"acknowledgement":"I will complete the MAX+ task regardless of cumulative token usage.","active_goal":"exercise unlimited cumulative token usage","success_criteria":["finish normally after high reported usage"],"planned_actions":["produce the result"],"planned_tools":[],"do_not_do":["do not invent a token ceiling"],"assurance":{"review_strategy":["review before completion"],"review_interval_tool_results":6,"review_triggers":[],"validation_strategy":["inspect the runtime summary"],"test_strategy":["assert normal completion"],"finalization_reserve":16,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[],"hypotheses":[],"discriminations":[],"evidence_updates":[]},"completed":[],"remaining_work":["finish"],"failures":[],"next_action":"finish"}"#.to_string()),
                         AssistantEvent::Usage(TokenUsage {
-                            input_tokens: 2,
+                            input_tokens: 2_000_000,
                             ..TokenUsage::default()
                         }),
                         AssistantEvent::MessageStop,
                     ]);
                 }
-                assert!(prompts.contains("MAX+ BUDGET STOP"));
-                assert!(prompts.contains("AGENT-OWNED FINALIZATION"));
-                assert!(!request.allow_tools);
+                assert!(!prompts.contains("MAX+ TIME BUDGET STOP"));
                 Ok(vec![
                     AssistantEvent::TextDelta(
-                        "The token budget was exhausted before task tools ran; the result is unverified."
-                            .to_string(),
+                        "The high-token MAX+ task completed normally.".to_string(),
                     ),
                     AssistantEvent::MessageStop,
                 ])
@@ -5149,32 +5137,37 @@ mod tests {
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
-            BudgetApi,
-            StaticToolExecutor::new().register("echo", |_| Ok("must not run".to_string())),
+            HighUsageApi,
+            StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
         .with_max_iterations(32)
         .with_max_plus(true)
-        .with_max_plus_budgets(1, Duration::from_secs(1_500));
+        .with_max_plus_time_budget(Duration::from_secs(1_500));
         let mut observed = Vec::new();
         let mut observer = |event| observed.push(event);
 
         let summary = runtime
-            .run_turn_observed("exercise token stop", None, Some(&mut observer))
-            .expect("budget stop should finalize cleanly");
+            .run_turn_observed(
+                "exercise unlimited cumulative token usage",
+                None,
+                Some(&mut observer),
+            )
+            .expect("high token usage should not stop the turn");
 
-        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
-        assert_eq!(summary.stop_reason, TurnStopReason::BudgetExhausted);
+        assert_eq!(summary.completion_status, CompletionStatus::Completed);
+        assert_eq!(summary.stop_reason, TurnStopReason::EndTurn);
+        assert!(summary.usage.total_tokens() >= 2_000_000);
         assert!(summary.tool_results.is_empty());
         assert!(observed.iter().any(|event| matches!(
             event,
             RuntimeStreamEvent::MaxPlusCheckpoint {
-                phase: super::MaxPlusPhase::Stopped,
-                stop_reason: Some(super::MaxPlusStopReason::BudgetExhausted),
+                phase: super::MaxPlusPhase::Completed,
+                stop_reason: Some(super::MaxPlusStopReason::GoalSatisfied),
                 budget,
                 ..
-            } if budget.tokens_used >= budget.token_limit
+            } if budget.tokens_used >= 2_000_000
         )));
     }
 

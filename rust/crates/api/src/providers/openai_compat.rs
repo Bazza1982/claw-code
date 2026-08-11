@@ -1609,9 +1609,10 @@ fn reasoning_fragments<const N: usize>(
 
     for (source, value) in fields {
         if let Some(value) = value {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                text_chunks.push(trimmed.to_string());
+            // A streaming delta's leading/trailing whitespace is semantic.
+            // Drop only truly empty values and forward every other byte intact.
+            if !value.is_empty() {
+                text_chunks.push(value.to_string());
                 sources.push(source.to_string());
             }
         }
@@ -1627,7 +1628,6 @@ fn reasoning_fragments<const N: usize>(
             .text
             .as_deref()
             .or(detail.summary.as_deref())
-            .map(str::trim)
             .filter(|value| !value.is_empty());
         if let Some(text) = text {
             let source = if detail.text.as_deref().is_some() {
@@ -2368,6 +2368,25 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn reasoning_fragments_preserve_exact_stream_whitespace() {
+        let mut reconstructed = String::new();
+        for piece in ["A", " ", "EST", " and was flag", "ged as miss", "ed"] {
+            let fragments = super::reasoning_fragments([("reasoning", Some(piece))], &[]);
+            reconstructed.push_str(&fragments[0].text);
+        }
+
+        assert_eq!(reconstructed, "A EST and was flagged as missed");
+
+        let details = vec![super::ReasoningDetail {
+            detail_type: Some("reasoning.text".to_string()),
+            text: Some(" detail with edges ".to_string()),
+            summary: None,
+        }];
+        let fragments = super::reasoning_fragments([("reasoning", None)], details.as_slice());
+        assert_eq!(fragments[0].text, " detail with edges ");
     }
 
     #[test]

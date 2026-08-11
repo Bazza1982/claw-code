@@ -1024,8 +1024,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "budget",
         aliases: &[],
-        summary: "Show or set token budget limits",
-        argument_hint: Some("[show|set <limit>]"),
+        summary: "Show token usage estimates",
+        argument_hint: Some("[show]"),
         resume_supported: true,
     },
     SlashCommandSpec {
