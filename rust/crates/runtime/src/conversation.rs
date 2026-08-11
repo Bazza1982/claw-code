@@ -41,7 +41,7 @@ const FINALIZATION_RESERVE_PROMPT: &str = r#"FINALIZATION RESERVE HAS STARTED. S
 const MAX_INDEPENDENT_REVIEW_PROMPT: &str = r#"MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR. You are a fresh, adversarial reviewer, not the task-performing agent. Judge only the supplied task artifacts and raw evidence. Do not continue the task, call tools, rewrite the answer, or trust agent-authored status fields when raw tool evidence conflicts with them. Look for correlated reasoning errors, missing counterexamples, invalid verification design, tests that do not prove the requested behavior, failed or skipped checks presented as success, scope or authorization drift, and claims stronger than the evidence. Return one JSON object only, without markdown fences, using this schema:
 {"decision":"pass|revise|block","summary":"concise independent judgment","findings":[{"severity":"critical|high|medium|low","category":"planning|verification|testing|claims|scope|risk","issue":"...","evidence":"exact supplied evidence or absence","required_change":"..."}],"missing_evidence":["..."],"required_changes":["..."],"evidence_refs":["specific artifact or raw result reviewed"]}
 PASS requires concrete evidence_refs and no unresolved critical/high finding or required change. REVISE requires an actionable finding or required change. BLOCK is reserved for an authorization boundary, irrecoverable contradiction, or exhausted safe route. When evidence is missing, truncated, ambiguous, or only asserted by the agent, do not infer success."#;
-const MAX_REVIEW_REVISION_PROMPT: &str = "MAX REVIEW REVISION REQUIRED. An independent evaluator rejected the previous plan or proposed completion. Address every required change using the active task scope and raw evidence. Use tools when necessary and allowed. Never convert missing or failed evidence into a success claim. If the evidence cannot be obtained, report the affected item as unverified or incomplete.";
+const MAX_REVIEW_REVISION_PROMPT: &str = "MAX REVIEW FEEDBACK. An independent evaluator identified concerns in the previous plan or proposed completion. Use the feedback to improve the work within the active task scope. The evaluator is advisory: it does not own execution and must not replace the task-performing agent's final answer. Address supported concerns using raw evidence, but reject irrelevant or disproportionate advice. Use tools when necessary and allowed. Never convert missing or failed evidence into a success claim. If evidence cannot be obtained, report the affected item as unverified or incomplete.";
 const MAX_REVIEW_MAX_REVISIONS: usize = 3;
 const MAX_TASK_FRAME_FORMAT_ATTEMPTS: usize = 3;
 const MAX_INDEPENDENT_REVIEW_FORMAT_ATTEMPTS: usize = 3;
@@ -894,7 +894,7 @@ where
         let mut max_execution_reviewed_tool_count: Option<usize> = None;
         let mut max_execution_revision_round = 0;
         let mut max_final_claim_revision_round = 0;
-        let mut max_critic_blocked_completion = false;
+        let mut max_agent_owned_finalization_due = false;
         let mut task_frame = if self.task_planning_enabled {
             let checkpoint_attempts = if self.max_independent_review_enabled {
                 MAX_TASK_FRAME_FORMAT_ATTEMPTS
@@ -927,23 +927,28 @@ where
                 Ok(checkpoint) => checkpoint,
                 Err(error) => {
                     if self.max_independent_review_enabled {
-                        return self.finish_incomplete_before_tools(
-                            format!(
-                                "Execution status: INCOMPLETE. The max-effort planning checkpoint could not produce a valid task frame after {checkpoint_attempts} format attempts, so no task tools were allowed to run. Unfinished or unverified: the requested work has not started. Stop reason: task-frame format recovery was exhausted ({error}). Recommended next step: retry the request with the same scope; if this repeats, inspect the captured planning responses before changing the task."
+                        max_review_feedback_due = Some(format!(
+                            "MAX PLANNING CHECKPOINT RECOVERY: Structured planning did not converge after {checkpoint_attempts} attempts ({error}). Continue the user's task using the authoritative request and normal authorization controls. Build a practical plan internally, perform useful work, and disclose any uncertainty in your own final answer."
+                        ));
+                        (
+                            fallback_max_task_frame(
+                                &authoritative_goal,
+                                self.effective_finalization_reserve(),
+                                &error,
                             ),
-                            prompt_cache_events,
-                            observer.as_deref_mut(),
-                        );
+                            Vec::new(),
+                        )
+                    } else {
+                        self.record_turn_failed(0, &error);
+                        return Err(error);
                     }
-                    self.record_turn_failed(0, &error);
-                    return Err(error);
                 }
             };
             prompt_cache_events.extend(checkpoint_cache_events);
             // The independent max planning review can require several slow model
             // round trips. Publish the already validated acknowledgement before
-            // that review so the user is not left with a silent task. Tools still
-            // remain blocked until the independent planning gate passes.
+            // that review so the user is not left with a silent task. Review is
+            // advisory: it improves the plan but never owns task execution.
             self.record_task_acknowledgement(&frame);
             if let Some(observer) = observer.as_deref_mut() {
                 observer(RuntimeStreamEvent::TaskAcknowledgement {
@@ -979,33 +984,29 @@ where
                     match review.decision {
                         IndependentReviewDecision::Pass => break,
                         IndependentReviewDecision::Block => {
-                            self.record_task_plan("planning_blocked", &frame);
+                            max_review_feedback_due =
+                                Some(independent_review_feedback("planning", &review));
+                            self.record_task_plan("planning_review_advisory", &frame);
                             if let Some(observer) = observer.as_deref_mut() {
                                 observer(RuntimeStreamEvent::TaskPlan {
-                                    phase: "planning_blocked".to_string(),
+                                    phase: "planning_review_advisory".to_string(),
                                     frame: frame.clone(),
                                 });
                             }
-                            return self.finish_incomplete_before_tools(
-                                independent_review_incomplete_report("planning", &review),
-                                prompt_cache_events,
-                                observer.as_deref_mut(),
-                            );
+                            break;
                         }
                         IndependentReviewDecision::Revise => {
                             if revision_round >= MAX_REVIEW_MAX_REVISIONS {
-                                self.record_task_plan("planning_revision_exhausted", &frame);
+                                max_review_feedback_due =
+                                    Some(independent_review_feedback("planning", &review));
+                                self.record_task_plan("planning_review_advisory", &frame);
                                 if let Some(observer) = observer.as_deref_mut() {
                                     observer(RuntimeStreamEvent::TaskPlan {
-                                        phase: "planning_revision_exhausted".to_string(),
+                                        phase: "planning_review_advisory".to_string(),
                                         frame: frame.clone(),
                                     });
                                 }
-                                return self.finish_incomplete_before_tools(
-                                    independent_review_incomplete_report("planning", &review),
-                                    prompt_cache_events,
-                                    observer.as_deref_mut(),
-                                );
+                                break;
                             }
                             revision_round += 1;
                             let reason = independent_review_feedback("planning", &review);
@@ -1029,8 +1030,11 @@ where
                                     Some(&recovery_reason),
                                 );
                             }
-                            let (revised, replan_cache_events) = match revised_checkpoint {
-                                Ok(result) => result,
+                            match revised_checkpoint {
+                                Ok((revised, replan_cache_events)) => {
+                                    prompt_cache_events.extend(replan_cache_events);
+                                    frame = revised;
+                                }
                                 Err(error) => {
                                     let failure = RuntimeError::new(format!(
                                         "max planning revision could not produce a valid task frame after {MAX_TASK_FRAME_FORMAT_ATTEMPTS} format attempts: {error}"
@@ -1051,18 +1055,13 @@ where
                                             frame: frame.clone(),
                                         });
                                     }
-                                    return self.finish_incomplete_before_tools(
-                                        independent_review_incomplete_report(
-                                            "planning",
-                                            &failed_review,
-                                        ),
-                                        prompt_cache_events,
-                                        observer.as_deref_mut(),
-                                    );
+                                    max_review_feedback_due = Some(format!(
+                                        "{}\n\nThe structured plan revision failed to parse. Continue from the last valid plan instead of stopping. Apply useful supported feedback pragmatically and keep unresolved concerns visible in the final answer.",
+                                        independent_review_feedback("planning", &failed_review)
+                                    ));
+                                    break;
                                 }
-                            };
-                            prompt_cache_events.extend(replan_cache_events);
-                            frame = revised;
+                            }
                         }
                     }
                 }
@@ -1176,6 +1175,9 @@ where
             if let Some(feedback) = max_review_feedback_due.take() {
                 iteration_system_prompt.push(feedback);
             }
+            if max_agent_owned_finalization_due {
+                iteration_system_prompt.push("AGENT-OWNED FINALIZATION: The independent review feedback budget is exhausted. The reviewer is advisory and must not replace your answer. Tools are disabled for this call. Produce the best honest user-visible final response yourself, grounded in the raw evidence already available. Address supported reviewer concerns, disclose unresolved uncertainty, and do not claim unsupported success.".to_string());
+            }
             if visible_finalization_retry_due {
                 iteration_system_prompt.push("VISIBLE FINALIZATION RECOVERY: The previous provider response contained reasoning but no user-visible answer. Tools are disabled. Return a concise visible answer now. If work is incomplete, report verified progress, uncertainty, stop reason, and the recommended next step. Do not continue execution.".to_string());
             }
@@ -1209,7 +1211,9 @@ where
             let request = ApiRequest {
                 system_prompt: iteration_system_prompt,
                 messages: self.session.messages.clone(),
-                allow_tools: !is_finalization_iteration && !visible_finalization_retry_due,
+                allow_tools: !is_finalization_iteration
+                    && !visible_finalization_retry_due
+                    && !max_agent_owned_finalization_due,
                 timeout: None,
             };
             if is_finalization_iteration {
@@ -1301,13 +1305,18 @@ where
             }
             let proposed_visible_answer = pending_tool_uses.is_empty()
                 && !user_visible_text(&assistant_message).trim().is_empty();
-            let mut forced_incomplete_by_critic = false;
-            if self.max_independent_review_enabled && proposed_visible_answer {
+            let accept_agent_owned_finalization =
+                max_agent_owned_finalization_due && proposed_visible_answer;
+            if self.max_independent_review_enabled
+                && proposed_visible_answer
+                && !accept_agent_owned_finalization
+            {
                 let frame = task_frame.as_ref().ok_or_else(|| {
                     RuntimeError::new(
                         "max independent review requires a preserved task frame before completion",
                     )
                 })?;
+                let mut execution_review_unresolved = false;
                 if max_execution_reviewed_tool_count != Some(tool_results.len()) {
                     let (review, review_cache_events) =
                         match self.run_independent_review(IndependentReviewInput {
@@ -1337,28 +1346,29 @@ where
                         IndependentReviewDecision::Pass => {
                             max_execution_reviewed_tool_count = Some(tool_results.len());
                         }
-                        IndependentReviewDecision::Revise
-                            if max_execution_revision_round < MAX_REVIEW_MAX_REVISIONS
-                                && !is_finalization_iteration =>
-                        {
-                            max_execution_revision_round += 1;
-                            max_review_feedback_due =
-                                Some(independent_review_feedback("execution_evidence", &review));
-                            continue;
-                        }
                         IndependentReviewDecision::Revise | IndependentReviewDecision::Block => {
-                            max_critic_blocked_completion = true;
-                            forced_incomplete_by_critic = true;
-                            assistant_message.blocks = vec![ContentBlock::Text {
-                                text: independent_review_incomplete_report(
-                                    "execution_evidence",
-                                    &review,
-                                ),
-                            }];
+                            execution_review_unresolved = true;
+                            if !is_finalization_iteration {
+                                if max_execution_revision_round < MAX_REVIEW_MAX_REVISIONS {
+                                    max_execution_revision_round += 1;
+                                    max_review_feedback_due = Some(independent_review_feedback(
+                                        "execution_evidence",
+                                        &review,
+                                    ));
+                                } else {
+                                    max_review_feedback_due =
+                                        Some(independent_review_finalization_feedback(
+                                            "execution_evidence",
+                                            &review,
+                                        ));
+                                    max_agent_owned_finalization_due = true;
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
-                if !forced_incomplete_by_critic {
+                if !execution_review_unresolved {
                     let (review, review_cache_events) =
                         match self.run_independent_review(IndependentReviewInput {
                             gate: "final_claim",
@@ -1384,20 +1394,22 @@ where
                     }
                     match review.decision {
                         IndependentReviewDecision::Pass => {}
-                        IndependentReviewDecision::Revise
-                            if max_final_claim_revision_round < MAX_REVIEW_MAX_REVISIONS
-                                && !is_finalization_iteration =>
-                        {
-                            max_final_claim_revision_round += 1;
-                            max_review_feedback_due =
-                                Some(independent_review_feedback("final_claim", &review));
-                            continue;
-                        }
                         IndependentReviewDecision::Revise | IndependentReviewDecision::Block => {
-                            max_critic_blocked_completion = true;
-                            assistant_message.blocks = vec![ContentBlock::Text {
-                                text: independent_review_incomplete_report("final_claim", &review),
-                            }];
+                            if !is_finalization_iteration {
+                                if max_final_claim_revision_round < MAX_REVIEW_MAX_REVISIONS {
+                                    max_final_claim_revision_round += 1;
+                                    max_review_feedback_due =
+                                        Some(independent_review_feedback("final_claim", &review));
+                                } else {
+                                    max_review_feedback_due =
+                                        Some(independent_review_finalization_feedback(
+                                            "final_claim",
+                                            &review,
+                                        ));
+                                    max_agent_owned_finalization_due = true;
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1651,18 +1663,13 @@ where
             tool_results,
             prompt_cache_events,
             iterations,
-            completion_status: if reached_execution_budget
-                || terminal_no_final_text
-                || max_critic_blocked_completion
-            {
+            completion_status: if reached_execution_budget || terminal_no_final_text {
                 CompletionStatus::Incomplete
             } else {
                 CompletionStatus::Completed
             },
             stop_reason: if terminal_no_final_text {
                 TurnStopReason::NoFinalText
-            } else if max_critic_blocked_completion {
-                TurnStopReason::IndependentReview
             } else if reached_execution_budget {
                 TurnStopReason::MaxIterations
             } else {
@@ -2022,39 +2029,6 @@ where
         session_tracer.record("turn_completed", attributes);
     }
 
-    fn finish_incomplete_before_tools(
-        &mut self,
-        text: String,
-        prompt_cache_events: Vec<PromptCacheEvent>,
-        observer: Option<&mut RuntimeStreamObserver<'_>>,
-    ) -> Result<TurnSummary, RuntimeError> {
-        let assistant_message =
-            ConversationMessage::assistant(vec![ContentBlock::Text { text: text.clone() }]);
-        self.record_assistant_iteration(0, &assistant_message, 0);
-        self.session
-            .push_message(assistant_message.clone())
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-        if let Some(observer) = observer {
-            observer(RuntimeStreamEvent::Assistant(AssistantEvent::TextDelta(
-                text,
-            )));
-            observer(RuntimeStreamEvent::Assistant(AssistantEvent::MessageStop));
-        }
-        let summary = TurnSummary {
-            assistant_messages: vec![assistant_message],
-            tool_results: Vec::new(),
-            prompt_cache_events,
-            iterations: 0,
-            completion_status: CompletionStatus::Incomplete,
-            stop_reason: TurnStopReason::IndependentReview,
-            provider_stop_reason: None,
-            usage: self.usage_tracker.cumulative_usage(),
-            auto_compaction: None,
-        };
-        self.record_turn_completed(&summary);
-        Ok(summary)
-    }
-
     fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
         let Some(session_tracer) = &self.session_tracer else {
             return;
@@ -2064,6 +2038,50 @@ where
         attributes.insert("iteration".to_string(), Value::from(iteration as u64));
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
+    }
+}
+
+fn fallback_max_task_frame(
+    authoritative_goal: &str,
+    finalization_reserve: usize,
+    planning_error: &RuntimeError,
+) -> TaskFrame {
+    let goal = authoritative_goal.trim();
+    let contains_chinese = goal
+        .chars()
+        .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character));
+    let acknowledgement = if contains_chinese {
+        "我会继续处理当前请求，执行必要步骤，并在最终答复中如实说明验证结果与不确定性。".to_string()
+    } else {
+        "I will continue the current request, perform the necessary work, and report verified results and uncertainty honestly."
+            .to_string()
+    };
+    TaskFrame {
+        acknowledgement,
+        active_goal: goal.to_string(),
+        success_criteria: vec!["Answer the authoritative request using task-matched evidence".to_string()],
+        planned_actions: vec!["Determine and execute the practical steps needed for the current request".to_string()],
+        planned_tools: Vec::new(),
+        do_not_do: vec!["Do not expand authorization beyond the current request".to_string()],
+        assurance: Some(Box::new(TaskAssurance {
+            review_strategy: vec!["Use independent feedback to improve the work without blocking execution".to_string()],
+            review_interval_tool_results: 6,
+            review_triggers: vec!["tool failure, scope change, or conflicting evidence".to_string()],
+            validation_strategy: vec!["Prefer raw task-matched evidence and disclose anything unverified".to_string()],
+            test_strategy: vec!["Run task-matched checks when applicable; otherwise explain why no behavioral test applies".to_string()],
+            finalization_reserve,
+            critical_review_findings: vec![format!(
+                "Structured planning was unavailable; execution continued from a conservative fallback: {planning_error}"
+            )],
+            validation_evidence: Vec::new(),
+            testing_evidence: Vec::new(),
+            claim_evidence: Vec::new(),
+            unverified_items: Vec::new(),
+        })),
+        completed: Vec::new(),
+        remaining_work: vec!["Perform the requested work and verify the result".to_string()],
+        failures: vec![format!("Structured planning unavailable: {planning_error}")],
+        next_action: "Begin practical task execution within the authoritative scope".to_string(),
     }
 }
 
@@ -2274,8 +2292,15 @@ fn independent_review_artifact(
 
 fn independent_review_feedback(gate: &str, review: &IndependentReview) -> String {
     format!(
-        "{MAX_REVIEW_REVISION_PROMPT}\nREJECTING GATE: {gate}\nINDEPENDENT VERDICT:\n{}",
+        "{MAX_REVIEW_REVISION_PROMPT}\nREVIEW STAGE: {gate}\nINDEPENDENT ADVISORY VERDICT:\n{}",
         serde_json::to_string(review).unwrap_or_default()
+    )
+}
+
+fn independent_review_finalization_feedback(gate: &str, review: &IndependentReview) -> String {
+    format!(
+        "{}\n\nFINAL ADVISORY ROUND: The review revision budget is exhausted. Do not stop the task and do not wait for another reviewer. The task-performing agent owns the final response. Produce the best evidence-grounded answer yourself, explicitly distinguishing verified results, unresolved concerns, and uncertainty.",
+        independent_review_feedback(gate, review)
     )
 }
 
@@ -2284,37 +2309,20 @@ fn failed_independent_review(gate: &str, error: &RuntimeError) -> IndependentRev
         decision: IndependentReviewDecision::Block,
         summary: format!("Independent {gate} review could not produce a valid verdict: {error}"),
         findings: vec![IndependentReviewFinding {
-            severity: "critical".to_string(),
+            severity: "medium".to_string(),
             category: "risk".to_string(),
-            issue: "The mandatory independent review itself failed".to_string(),
+            issue: "The advisory independent review was unavailable".to_string(),
             evidence: error.to_string(),
-            required_change: "Do not claim completion without a valid independent review"
-                .to_string(),
+            required_change:
+                "Continue with the task agent and preserve uncertainty where evidence is weak"
+                    .to_string(),
         }],
-        missing_evidence: vec!["valid independent review verdict".to_string()],
+        missing_evidence: vec!["independent reviewer opinion".to_string()],
         required_changes: vec![
-            "rerun the independent review or report the task as incomplete".to_string(),
+            "Use available raw evidence and let the task agent finalize".to_string()
         ],
         evidence_refs: vec![format!("runtime {gate} review error")],
     }
-}
-
-fn independent_review_incomplete_report(gate: &str, review: &IndependentReview) -> String {
-    let unresolved = review
-        .required_changes
-        .iter()
-        .chain(review.missing_evidence.iter())
-        .filter(|item| !item.trim().is_empty())
-        .cloned()
-        .collect::<Vec<_>>();
-    let unresolved = if unresolved.is_empty() {
-        review.summary.clone()
-    } else {
-        unresolved.join("; ")
-    };
-    format!(
-        "Execution status: INCOMPLETE. Independent max-effort review did not pass the {gate} gate. Verified progress is preserved, but completion is not claimed. Unfinished or unverified: {unresolved}. Stop reason: independent review blocked completion or the three-round revision budget was exhausted. Recommended next step: continue with the required evidence or revise the rejected claims."
-    )
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -4289,9 +4297,10 @@ mod tests {
     }
 
     #[test]
-    fn max_effort_fails_closed_after_three_execution_review_revisions() {
+    fn max_effort_returns_agent_owned_final_after_execution_review_exhaustion() {
         struct RejectingMaxReviewApi {
             execution_calls: usize,
+            finalization_calls: usize,
         }
 
         impl ApiClient for RejectingMaxReviewApi {
@@ -4315,6 +4324,20 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]);
                 }
+                if request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("AGENT-OWNED FINALIZATION"))
+                {
+                    self.finalization_calls += 1;
+                    assert!(!request.allow_tools);
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "I could not verify the state from the available evidence.".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
                 if !request.allow_tools {
                     return Ok(vec![
                         AssistantEvent::TextDelta(r#"{"acknowledgement":"I will verify the requested state before answering.","active_goal":"verify state","success_criteria":["state is evidenced"],"planned_actions":["verify"],"planned_tools":[],"do_not_do":["do not mutate"],"assurance":{"review_strategy":["review before answering"],"review_interval_tool_results":6,"review_triggers":["missing evidence"],"validation_strategy":["use direct evidence"],"test_strategy":["state explicitly that no behavioral test applies to this read-only fact check"],"finalization_reserve":4,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[]},"completed":[],"remaining_work":["verify"],"failures":[],"next_action":"verify"}"#.to_string()),
@@ -4331,7 +4354,10 @@ mod tests {
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
-            RejectingMaxReviewApi { execution_calls: 0 },
+            RejectingMaxReviewApi {
+                execution_calls: 0,
+                finalization_calls: 0,
+            },
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
@@ -4342,23 +4368,27 @@ mod tests {
 
         let summary = runtime
             .run_turn("verify state", None)
-            .expect("critic exhaustion should preserve an incomplete result");
+            .expect("critic exhaustion should return control to the task agent");
 
         assert_eq!(runtime.api_client_mut().execution_calls, 4);
-        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
-        assert_eq!(summary.stop_reason, TurnStopReason::IndependentReview);
+        assert_eq!(runtime.api_client_mut().finalization_calls, 1);
+        assert_eq!(summary.completion_status, CompletionStatus::Completed);
+        assert_eq!(summary.stop_reason, TurnStopReason::EndTurn);
         let final_text = super::user_visible_text(
             summary
                 .assistant_messages
                 .last()
-                .expect("deterministic incomplete report"),
+                .expect("task agent final answer"),
         );
-        assert!(final_text.contains("INCOMPLETE"));
+        assert_eq!(
+            final_text,
+            "I could not verify the state from the available evidence."
+        );
         assert!(!final_text.contains("definitely verified"));
     }
 
     #[test]
-    fn max_planning_block_returns_visible_incomplete_result_instead_of_runtime_error() {
+    fn max_planning_block_is_advisory_and_task_agent_still_answers() {
         struct PlanningBlockApi {
             execution_calls: usize,
         }
@@ -4370,14 +4400,29 @@ mod tests {
                     .iter()
                     .any(|part| part.contains("MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR"))
                 {
+                    let planning = request
+                        .system_prompt
+                        .iter()
+                        .any(|part| part.contains("PLANNING GATE"));
+                    let response = if planning {
+                        r#"{"decision":"block","summary":"The requested mutation lacks authorization.","findings":[{"severity":"critical","category":"scope","issue":"authorization is missing","evidence":"authoritative goal does not approve mutation","required_change":"obtain user authorization"}],"missing_evidence":["explicit authorization"],"required_changes":["ask the user"],"evidence_refs":["authoritative goal"]}"#
+                    } else {
+                        r#"{"decision":"pass","summary":"The agent correctly asks for authorization without mutating state.","findings":[],"missing_evidence":[],"required_changes":[],"evidence_refs":["proposed answer"]}"#
+                    };
                     return Ok(vec![
-                        AssistantEvent::TextDelta(r#"{"decision":"block","summary":"The requested mutation lacks authorization.","findings":[{"severity":"critical","category":"scope","issue":"authorization is missing","evidence":"authoritative goal does not approve mutation","required_change":"obtain user authorization"}],"missing_evidence":["explicit authorization"],"required_changes":["ask the user"],"evidence_refs":["authoritative goal"]}"#.to_string()),
+                        AssistantEvent::TextDelta(response.to_string()),
                         AssistantEvent::MessageStop,
                     ]);
                 }
                 if request.allow_tools {
                     self.execution_calls += 1;
-                    unreachable!("planning block must stop before execution");
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "I need explicit authorization before making that mutation."
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
                 }
                 Ok(vec![
                     AssistantEvent::TextDelta(r#"{"acknowledgement":"I will review the requested mutation before any tools run.","active_goal":"review requested mutation","success_criteria":["authorization is confirmed"],"planned_actions":["review scope"],"planned_tools":[],"do_not_do":["do not mutate without authorization"],"assurance":{"review_strategy":["review before tools"],"review_interval_tool_results":6,"review_triggers":["missing authorization"],"validation_strategy":["confirm explicit authorization"],"test_strategy":["no behavioral test applies before authorization"],"finalization_reserve":4,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[]},"completed":[],"remaining_work":["confirm authorization"],"failures":[],"next_action":"review scope"}"#.to_string()),
@@ -4401,26 +4446,127 @@ mod tests {
 
         let summary = runtime
             .run_turn_observed("review mutation", None, Some(&mut observer))
-            .expect("planning block should be a semantic incomplete result");
+            .expect("planning advice should return control to the task agent");
 
-        assert_eq!(runtime.api_client_mut().execution_calls, 0);
-        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
-        assert_eq!(summary.stop_reason, TurnStopReason::IndependentReview);
-        assert!(super::user_visible_text(&summary.assistant_messages[0]).contains("INCOMPLETE"));
+        assert_eq!(runtime.api_client_mut().execution_calls, 1);
+        assert_eq!(summary.completion_status, CompletionStatus::Completed);
+        assert_eq!(summary.stop_reason, TurnStopReason::EndTurn);
+        assert_eq!(
+            super::user_visible_text(summary.assistant_messages.last().expect("agent answer")),
+            "I need explicit authorization before making that mutation."
+        );
         assert!(observed.iter().any(|event| matches!(
             event,
-            RuntimeStreamEvent::TaskPlan { phase, .. } if phase == "planning_blocked"
-        )));
-        assert!(observed.iter().any(|event| matches!(
-            event,
-            RuntimeStreamEvent::Assistant(AssistantEvent::TextDelta(text)) if text.contains("INCOMPLETE")
+            RuntimeStreamEvent::TaskPlan { phase, .. } if phase == "planning_review_advisory"
         )));
     }
 
     #[test]
-    fn max_invalid_planning_review_exhaustion_returns_visible_incomplete_result() {
+    fn max_planning_revision_format_exhaustion_continues_with_last_valid_plan() {
+        struct ReplanFormatApi {
+            replan_attempts: usize,
+            execution_calls: usize,
+        }
+
+        impl ApiClient for ReplanFormatApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR"))
+                {
+                    let planning = request
+                        .system_prompt
+                        .iter()
+                        .any(|part| part.contains("PLANNING GATE"));
+                    let response = if planning {
+                        r#"{"decision":"revise","summary":"Clarify the evidence window.","findings":[{"severity":"medium","category":"planning","issue":"window is vague","evidence":"task frame","required_change":"clarify pragmatically"}],"missing_evidence":[],"required_changes":["clarify the evidence window"],"evidence_refs":["task frame"]}"#
+                    } else {
+                        r#"{"decision":"pass","summary":"The agent answer is grounded in the inspection result.","findings":[],"missing_evidence":[],"required_changes":[],"evidence_refs":["raw inspect result"]}"#
+                    };
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(response.to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("TASK CONTROL REPLAN"))
+                {
+                    self.replan_attempts += 1;
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("not a task frame".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if !request.allow_tools {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(r#"{"acknowledgement":"I will inspect the recent security state and report remaining uncertainty.","active_goal":"inspect recent security state","success_criteria":["report inspected state"],"planned_actions":["inspect evidence"],"planned_tools":["inspect"],"do_not_do":["do not mutate"],"assurance":{"review_strategy":["review evidence"],"review_interval_tool_results":6,"review_triggers":["missing evidence"],"validation_strategy":["use inspection result"],"test_strategy":["no behavioral test applies to this read-only inspection"],"finalization_reserve":4,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[]},"completed":[],"remaining_work":["inspect"],"failures":[],"next_action":"inspect"}"#.to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                self.execution_calls += 1;
+                if self.execution_calls == 1 {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "inspect-1".to_string(),
+                            name: "inspect".to_string(),
+                            input: "recent-security-state".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "I inspected the security state and found one item still uncertain."
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let inspect_calls = Rc::new(Cell::new(0));
+        let inspect_calls_for_tool = Rc::clone(&inspect_calls);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ReplanFormatApi {
+                replan_attempts: 0,
+                execution_calls: 0,
+            },
+            StaticToolExecutor::new().register("inspect", move |_| {
+                inspect_calls_for_tool.set(inspect_calls_for_tool.get() + 1);
+                Ok("one recent item remains uncertain".to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(10)
+        .with_task_assurance(true, 4)
+        .with_max_independent_review(true);
+
+        let summary = runtime
+            .run_turn("inspect recent security state", None)
+            .expect("invalid plan revision must not stop task execution");
+
+        assert_eq!(runtime.api_client_mut().replan_attempts, 3);
+        assert_eq!(inspect_calls.get(), 1);
+        assert_eq!(summary.completion_status, CompletionStatus::Completed);
+        assert_eq!(summary.stop_reason, TurnStopReason::EndTurn);
+        assert_eq!(
+            super::user_visible_text(summary.assistant_messages.last().expect("agent answer")),
+            "I inspected the security state and found one item still uncertain."
+        );
+    }
+
+    #[test]
+    fn max_invalid_review_output_never_replaces_the_task_agent_final_answer() {
         struct InvalidReviewApi {
             review_calls: usize,
+            execution_calls: usize,
+            finalization_calls: usize,
         }
 
         impl ApiClient for InvalidReviewApi {
@@ -4436,6 +4582,29 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]);
                 }
+                if request
+                    .system_prompt
+                    .iter()
+                    .any(|part| part.contains("AGENT-OWNED FINALIZATION"))
+                {
+                    self.finalization_calls += 1;
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "I inspected the available state and am reporting it with uncertainty."
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if request.allow_tools {
+                    self.execution_calls += 1;
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "The available state remains uncertain.".to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
                 Ok(vec![
                     AssistantEvent::TextDelta(r#"{"acknowledgement":"I will inspect the requested state without mutation.","active_goal":"inspect state","success_criteria":["state is reported"],"planned_actions":["inspect"],"planned_tools":[],"do_not_do":["do not mutate"],"assurance":{"review_strategy":["review before tools"],"review_interval_tool_results":6,"review_triggers":[],"validation_strategy":["use direct evidence"],"test_strategy":["no behavioral test applies"],"finalization_reserve":4,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[]},"completed":[],"remaining_work":["inspect"],"failures":[],"next_action":"inspect"}"#.to_string()),
                     AssistantEvent::MessageStop,
@@ -4445,7 +4614,11 @@ mod tests {
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
-            InvalidReviewApi { review_calls: 0 },
+            InvalidReviewApi {
+                review_calls: 0,
+                execution_calls: 0,
+                finalization_calls: 0,
+            },
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::ReadOnly),
             vec!["system".to_string()],
@@ -4456,12 +4629,17 @@ mod tests {
 
         let summary = runtime
             .run_turn("inspect state", None)
-            .expect("invalid critic output should fail closed semantically");
+            .expect("invalid critic output should degrade to agent-owned finalization");
 
-        assert_eq!(runtime.api_client_mut().review_calls, 3);
-        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
-        assert_eq!(summary.stop_reason, TurnStopReason::IndependentReview);
-        assert!(super::user_visible_text(&summary.assistant_messages[0]).contains("INCOMPLETE"));
+        assert_eq!(runtime.api_client_mut().review_calls, 15);
+        assert_eq!(runtime.api_client_mut().execution_calls, 4);
+        assert_eq!(runtime.api_client_mut().finalization_calls, 1);
+        assert_eq!(summary.completion_status, CompletionStatus::Completed);
+        assert_eq!(summary.stop_reason, TurnStopReason::EndTurn);
+        assert_eq!(
+            super::user_visible_text(summary.assistant_messages.last().expect("agent answer")),
+            "I inspected the available state and am reporting it with uncertainty."
+        );
     }
 
     #[test]
