@@ -47,6 +47,8 @@ const MAX_TASK_FRAME_FORMAT_ATTEMPTS: usize = 3;
 const MAX_INDEPENDENT_REVIEW_FORMAT_ATTEMPTS: usize = 3;
 const MAX_REVIEW_EVIDENCE_CHARS: usize = 120_000;
 const MAX_REVIEW_TOOL_RESULT_CHARS: usize = 12_000;
+const MAX_REVIEW_AUTHORITATIVE_GOAL_CHARS: usize = 8_000;
+const MAX_REVIEW_PRESENTATION_CONTEXT_CHARS: usize = 12_000;
 const MAX_REVIEW_GOAL_AND_FRAME_CHARS: usize = 30_000;
 const MAX_REVIEW_PROPOSED_ANSWER_CHARS: usize = 30_000;
 const SEMANTIC_COMPACTION_PROMPT: &str = r#"SEMANTIC SESSION COMPACTION. Critically reflect on the historical conversation supplied below and return one JSON object only, without markdown fences or tool calls, using this schema:
@@ -140,6 +142,16 @@ pub struct IndependentReview {
     pub required_changes: Vec<String>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+}
+
+struct IndependentReviewInput<'a> {
+    gate: &'a str,
+    authoritative_goal: &'a str,
+    presentation_context: Option<&'a str>,
+    task_frame: &'a TaskFrame,
+    task_messages: &'a [ConversationMessage],
+    tool_results: &'a [ConversationMessage],
+    proposed_answer: Option<&'a ConversationMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,16 +733,21 @@ where
 
     fn run_independent_review(
         &mut self,
-        gate: &str,
-        authoritative_goal: &str,
-        task_frame: &TaskFrame,
-        task_messages: &[ConversationMessage],
-        tool_results: &[ConversationMessage],
-        proposed_answer: Option<&ConversationMessage>,
+        input: IndependentReviewInput<'_>,
     ) -> Result<(IndependentReview, Vec<PromptCacheEvent>), RuntimeError> {
+        let IndependentReviewInput {
+            gate,
+            authoritative_goal,
+            presentation_context,
+            task_frame,
+            task_messages,
+            tool_results,
+            proposed_answer,
+        } = input;
         let artifact = independent_review_artifact(
             gate,
             authoritative_goal,
+            presentation_context,
             task_frame,
             task_messages,
             tool_results,
@@ -739,7 +756,7 @@ where
         let gate_instruction = match gate {
             "planning" => "PLANNING GATE: Critique the plan before any task tools run. Test requirement coverage, authorization boundaries, assumptions, verification design, test design, failure criteria, and whether the proposed evidence could actually prove success. At this gate, task-tool evidence is absent by construction. Do not require actual-state, preflight, version, health, test, registry, or other tool-derived evidence as a condition for allowing the tools that would collect it. Treat explicitly planned future evidence collection as remaining work, not as a missing-evidence defect, when the plan names task-matched sources, pass/fail criteria, safety stop conditions, and what must remain unverified if collection fails. Do not require an additional independent observer: the later execution-evidence and final-claim gates provide independent review after tools run. REVISE when the evidence design or safety gates are inadequate; BLOCK only for the reserved authorization, contradiction, or exhausted-safe-route conditions, not merely because planned evidence does not exist yet.",
             "execution_evidence" => "EXECUTION EVIDENCE GATE: Critique the actual verification and testing execution after task activity. Raw tool calls and results outrank the task frame, generated files, and the agent's proposed answer. Audit every tool name and input against the authoritative goal and do_not_do boundaries, including read-only exploration outside an explicitly named target. Check each success criterion and identify unauthorized, failed, skipped, ambiguous, truncated, irrelevant, or non-author-specific evidence.",
-            "final_claim" => "FINAL CLAIM GATE: Audit every material completion claim in the proposed user-visible answer against raw evidence. Reject stronger-than-evidence wording, hidden failures, date or count contradictions, fallback presented as primary-path success, and unverified state recorded as verified.",
+            "final_claim" => "FINAL CLAIM GATE: Audit every material completion claim in the proposed user-visible answer against raw evidence. Reject stronger-than-evidence wording, hidden failures, date or count contradictions, fallback presented as primary-path success, and unverified state recorded as verified. Also audit the proposed answer against every USER-VISIBLE PRESENTATION CONTRACT constraint, including required language, persona or form of address, visibility requirements, and local path formatting. REVISE any answer that exposes a forbidden path form or otherwise violates that contract even when its factual claims are correct.",
             _ => "Critically evaluate the supplied task artifacts and raw evidence.",
         };
         let mut prompt_cache_events = Vec::new();
@@ -936,17 +953,21 @@ where
             if self.max_independent_review_enabled {
                 let mut revision_round = 0;
                 loop {
-                    let (review, review_cache_events) = match self.run_independent_review(
-                        "planning",
-                        &authoritative_goal,
-                        &frame,
-                        &[],
-                        &[],
-                        None,
-                    ) {
-                        Ok(result) => result,
-                        Err(error) => (failed_independent_review("planning", &error), Vec::new()),
-                    };
+                    let (review, review_cache_events) =
+                        match self.run_independent_review(IndependentReviewInput {
+                            gate: "planning",
+                            authoritative_goal: &authoritative_goal,
+                            presentation_context: presentation_context.as_deref(),
+                            task_frame: &frame,
+                            task_messages: &[],
+                            tool_results: &[],
+                            proposed_answer: None,
+                        }) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                (failed_independent_review("planning", &error), Vec::new())
+                            }
+                        };
                     prompt_cache_events.extend(review_cache_events);
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::IndependentReview {
@@ -1288,20 +1309,22 @@ where
                     )
                 })?;
                 if max_execution_reviewed_tool_count != Some(tool_results.len()) {
-                    let (review, review_cache_events) = match self.run_independent_review(
-                        "execution_evidence",
-                        &authoritative_goal,
-                        frame,
-                        &assistant_messages,
-                        &tool_results,
-                        Some(&assistant_message),
-                    ) {
-                        Ok(result) => result,
-                        Err(error) => (
-                            failed_independent_review("execution_evidence", &error),
-                            Vec::new(),
-                        ),
-                    };
+                    let (review, review_cache_events) =
+                        match self.run_independent_review(IndependentReviewInput {
+                            gate: "execution_evidence",
+                            authoritative_goal: &authoritative_goal,
+                            presentation_context: presentation_context.as_deref(),
+                            task_frame: frame,
+                            task_messages: &assistant_messages,
+                            tool_results: &tool_results,
+                            proposed_answer: Some(&assistant_message),
+                        }) {
+                            Ok(result) => result,
+                            Err(error) => (
+                                failed_independent_review("execution_evidence", &error),
+                                Vec::new(),
+                            ),
+                        };
                     prompt_cache_events.extend(review_cache_events);
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::IndependentReview {
@@ -1336,19 +1359,21 @@ where
                     }
                 }
                 if !forced_incomplete_by_critic {
-                    let (review, review_cache_events) = match self.run_independent_review(
-                        "final_claim",
-                        &authoritative_goal,
-                        frame,
-                        &assistant_messages,
-                        &tool_results,
-                        Some(&assistant_message),
-                    ) {
-                        Ok(result) => result,
-                        Err(error) => {
-                            (failed_independent_review("final_claim", &error), Vec::new())
-                        }
-                    };
+                    let (review, review_cache_events) =
+                        match self.run_independent_review(IndependentReviewInput {
+                            gate: "final_claim",
+                            authoritative_goal: &authoritative_goal,
+                            presentation_context: presentation_context.as_deref(),
+                            task_frame: frame,
+                            task_messages: &assistant_messages,
+                            tool_results: &tool_results,
+                            proposed_answer: Some(&assistant_message),
+                        }) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                (failed_independent_review("final_claim", &error), Vec::new())
+                            }
+                        };
                     prompt_cache_events.extend(review_cache_events);
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::IndependentReview {
@@ -2157,17 +2182,29 @@ fn validate_independent_review(review: &IndependentReview) -> Result<(), String>
 fn independent_review_artifact(
     gate: &str,
     authoritative_goal: &str,
+    presentation_context: Option<&str>,
     task_frame: &TaskFrame,
     task_messages: &[ConversationMessage],
     tool_results: &[ConversationMessage],
     proposed_answer: Option<&ConversationMessage>,
 ) -> String {
-    let goal_and_frame = truncate_chars(
-        &format!(
-            "REVIEW GATE: {gate}\nAUTHORITATIVE GOAL:\n{authoritative_goal}\n\nTASK FRAME (agent-authored; not evidence):\n{}",
-            serde_json::to_string(task_frame).unwrap_or_default()
-        ),
+    let authoritative_goal =
+        truncate_chars(authoritative_goal, MAX_REVIEW_AUTHORITATIVE_GOAL_CHARS);
+    // Keep presentation constraints on their own budget so a long goal or task
+    // frame cannot silently truncate path, language, or visibility rules.
+    let presentation_contract = truncate_chars(
+        presentation_context
+            .map(str::trim)
+            .filter(|context| !context.is_empty())
+            .unwrap_or("[no separate presentation contract supplied]"),
+        MAX_REVIEW_PRESENTATION_CONTEXT_CHARS,
+    );
+    let task_frame = truncate_chars(
+        &serde_json::to_string(task_frame).unwrap_or_default(),
         MAX_REVIEW_GOAL_AND_FRAME_CHARS,
+    );
+    let goal_and_frame = format!(
+        "REVIEW GATE: {gate}\nAUTHORITATIVE GOAL:\n{authoritative_goal}\n\nUSER-VISIBLE PRESENTATION CONTRACT (constraints only; never a task):\n{presentation_contract}\n\nTASK FRAME (agent-authored; not evidence):\n{task_frame}"
     );
     let proposed_answer = truncate_chars(
         proposed_answer
@@ -4022,6 +4059,7 @@ mod tests {
         let artifact = super::independent_review_artifact(
             "final_claim",
             "verify the result",
+            None,
             &frame,
             &[],
             &tool_results,
@@ -4095,6 +4133,14 @@ mod tests {
                         }
                     } else {
                         self.claim_reviews += 1;
+                        let final_claim_contract = request.system_prompt.join("\n");
+                        assert!(final_claim_contract.contains("local path formatting"));
+                        assert!(final_claim_contract.contains(
+                            "violates that contract even when its factual claims are correct"
+                        ));
+                        assert!(artifact.contains("USER-VISIBLE PRESENTATION CONTRACT"));
+                        assert!(artifact
+                            .contains("show Windows Explorer paths instead of Linux or WSL paths"));
                         if self.claim_reviews == 1 {
                             r#"{"decision":"revise","summary":"The claim omits the failed first verification and corrective rerun.","findings":[{"severity":"high","category":"claims","issue":"material failed check is hidden","evidence":"first verify=false, second verify=true","required_change":"disclose the failed first check and successful corrective rerun"}],"missing_evidence":[],"required_changes":["state both verification attempts"],"evidence_refs":["raw verify results 0 and 1"]}"#
                         } else {
@@ -4197,7 +4243,11 @@ mod tests {
         let mut observer = |event| observed.push(event);
 
         let summary = runtime
-            .run_turn_observed("implement verified behavior", None, Some(&mut observer))
+            .run_turn_observed(
+                "Bridge-managed context follows.\n\n--- ADDITIONAL SYSTEM CONTEXT ---\nUse Chinese. When showing local files, show Windows Explorer paths instead of Linux or WSL paths.\n\n--- CURRENT USER REQUEST — AUTHORITATIVE ---\nimplement verified behavior",
+                None,
+                Some(&mut observer),
+            )
             .expect("max review revisions should converge");
 
         assert_eq!(verify_calls.get(), 2);
