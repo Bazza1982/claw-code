@@ -13564,6 +13564,38 @@ fn runtime_stream_event_json(event: RuntimeStreamEvent) -> serde_json::Value {
             "summary": review.summary,
             "review": review,
         }),
+        RuntimeStreamEvent::ControlInvocation {
+            stage,
+            gate,
+            revision_round,
+            format_attempt,
+            system_prompt,
+            user_message,
+            raw_output,
+            outcome,
+            error,
+            usage,
+        } => json!({
+            "kind": "control_invocation",
+            "stage": stage,
+            "gate": gate,
+            "revision_round": revision_round,
+            "format_attempt": format_attempt,
+            "request": {
+                "system_prompt": system_prompt,
+                "user_message": user_message,
+                "allow_tools": false,
+            },
+            "raw_output": raw_output,
+            "outcome": outcome,
+            "error": error,
+            "usage": usage.map(|usage| json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": usage.cache_read_input_tokens,
+            })),
+        }),
         RuntimeStreamEvent::PlanDivergence { tool_name, reason } => json!({
             "kind": "plan_divergence",
             "tool_name": tool_name,
@@ -15481,6 +15513,44 @@ mod tests {
             });
         assert_eq!(redacted["kind"], json!("thinking_redacted"));
         assert!(redacted.get("text").is_none());
+    }
+
+    #[test]
+    fn stream_json_control_invocation_preserves_raw_io_and_usage() {
+        let event =
+            super::runtime_stream_event_json(runtime::RuntimeStreamEvent::ControlInvocation {
+                stage: "independent_review".to_string(),
+                gate: "final_claim".to_string(),
+                revision_round: 2,
+                format_attempt: 1,
+                system_prompt: vec!["FINAL CLAIM GATE".to_string()],
+                user_message: "raw evidence packet".to_string(),
+                raw_output: r#"{"decision":"revise"}"#.to_string(),
+                outcome: "parsed".to_string(),
+                error: None,
+                usage: Some(runtime::TokenUsage {
+                    input_tokens: 101,
+                    output_tokens: 23,
+                    cache_creation_input_tokens: 7,
+                    cache_read_input_tokens: 11,
+                }),
+            });
+
+        assert_eq!(event["kind"], json!("control_invocation"));
+        assert_eq!(event["gate"], json!("final_claim"));
+        assert_eq!(event["revision_round"], json!(2));
+        assert_eq!(event["format_attempt"], json!(1));
+        assert_eq!(
+            event["request"]["system_prompt"][0],
+            json!("FINAL CLAIM GATE")
+        );
+        assert_eq!(
+            event["request"]["user_message"],
+            json!("raw evidence packet")
+        );
+        assert_eq!(event["raw_output"], json!(r#"{"decision":"revise"}"#));
+        assert_eq!(event["usage"]["input_tokens"], json!(101));
+        assert_eq!(event["usage"]["output_tokens"], json!(23));
     }
 
     #[test]

@@ -146,12 +146,26 @@ pub struct IndependentReview {
 
 struct IndependentReviewInput<'a> {
     gate: &'a str,
+    revision_round: usize,
     authoritative_goal: &'a str,
     presentation_context: Option<&'a str>,
     task_frame: &'a TaskFrame,
     task_messages: &'a [ConversationMessage],
     tool_results: &'a [ConversationMessage],
     proposed_answer: Option<&'a ConversationMessage>,
+}
+
+struct ControlInvocationRecord<'a> {
+    stage: &'a str,
+    gate: &'a str,
+    revision_round: usize,
+    format_attempt: usize,
+    system_prompt: Vec<String>,
+    user_message: String,
+    raw_output: String,
+    outcome: &'a str,
+    error: Option<String>,
+    usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +269,18 @@ pub enum RuntimeStreamEvent {
         gate: String,
         revision_round: usize,
         review: IndependentReview,
+    },
+    ControlInvocation {
+        stage: String,
+        gate: String,
+        revision_round: usize,
+        format_attempt: usize,
+        system_prompt: Vec<String>,
+        user_message: String,
+        raw_output: String,
+        outcome: String,
+        error: Option<String>,
+        usage: Option<TokenUsage>,
     },
     PlanDivergence {
         tool_name: String,
@@ -432,6 +458,7 @@ pub struct ConversationRuntime<C, T> {
     task_assurance_enabled: bool,
     max_independent_review_enabled: bool,
     finalization_reserve: usize,
+    pending_control_events: Vec<RuntimeStreamEvent>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -485,6 +512,7 @@ where
             task_assurance_enabled: false,
             max_independent_review_enabled: false,
             finalization_reserve: 0,
+            pending_control_events: Vec::new(),
         }
     }
 
@@ -631,6 +659,8 @@ where
         presentation_context: Option<&str>,
         previous: Option<&TaskFrame>,
         review_reason: Option<&str>,
+        revision_round: usize,
+        format_attempt: usize,
     ) -> Result<(TaskFrame, Vec<PromptCacheEvent>), RuntimeError> {
         let mut system_prompt = self.system_prompt.clone();
         system_prompt.push(AUTHORIZATION_INTERPRETATION_PROMPT.to_string());
@@ -677,17 +707,47 @@ where
             allow_tools: false,
             timeout: None,
         };
-        let events = self.api_client.stream(request).map_err(|error| {
-            RuntimeError::new(format!(
-                "task understanding checkpoint failed before execution: {error}"
-            ))
-        })?;
-        let (message, usage, prompt_cache_events) =
-            build_assistant_message(events).map_err(|error| {
-                RuntimeError::new(format!(
-                    "task understanding checkpoint returned no usable response: {error}"
-                ))
-            })?;
+        let request_system_prompt = request.system_prompt.clone();
+        let events = match self.api_client.stream(request) {
+            Ok(events) => events,
+            Err(error) => {
+                let error =
+                    format!("task understanding checkpoint failed before execution: {error}");
+                self.record_control_invocation(ControlInvocationRecord {
+                    stage: "planning",
+                    gate: "planning",
+                    revision_round,
+                    format_attempt,
+                    system_prompt: request_system_prompt,
+                    user_message: active_goal.to_string(),
+                    raw_output: String::new(),
+                    outcome: "provider_error",
+                    error: Some(error.clone()),
+                    usage: None,
+                });
+                return Err(RuntimeError::new(error));
+            }
+        };
+        let (message, usage, prompt_cache_events) = match build_assistant_message(events) {
+            Ok(result) => result,
+            Err(error) => {
+                let error =
+                    format!("task understanding checkpoint returned no usable response: {error}");
+                self.record_control_invocation(ControlInvocationRecord {
+                    stage: "planning",
+                    gate: "planning",
+                    revision_round,
+                    format_attempt,
+                    system_prompt: request_system_prompt,
+                    user_message: active_goal.to_string(),
+                    raw_output: String::new(),
+                    outcome: "response_error",
+                    error: Some(error.clone()),
+                    usage: None,
+                });
+                return Err(RuntimeError::new(error));
+            }
+        };
         if let Some(usage) = usage {
             self.usage_tracker.record(usage);
         }
@@ -700,34 +760,57 @@ where
             })
             .collect::<Vec<_>>()
             .join("");
-        let mut frame = parse_task_frame(&raw).ok_or_else(|| {
-            RuntimeError::new(
-                "task understanding checkpoint returned an invalid task frame; execution stopped before tools",
-            )
-        })?;
-        if let Some(previous) = previous {
-            frame.active_goal = previous.active_goal.clone();
-            for boundary in &previous.do_not_do {
-                if !frame.do_not_do.contains(boundary) {
-                    frame.do_not_do.push(boundary.clone());
+        let parsed = (|| {
+            let mut frame = parse_task_frame(&raw).ok_or_else(|| {
+                RuntimeError::new(
+                    "task understanding checkpoint returned an invalid task frame; execution stopped before tools",
+                )
+            })?;
+            if let Some(previous) = previous {
+                frame.active_goal = previous.active_goal.clone();
+                for boundary in &previous.do_not_do {
+                    if !frame.do_not_do.contains(boundary) {
+                        frame.do_not_do.push(boundary.clone());
+                    }
+                }
+                if frame.acknowledgement.trim().is_empty() {
+                    frame.acknowledgement = previous.acknowledgement.clone();
+                }
+                if self.task_assurance_enabled {
+                    preserve_assurance_boundaries(&mut frame, previous);
+                }
+            } else {
+                validate_initial_task_frame(&frame)?;
+                if self.task_assurance_enabled {
+                    apply_runtime_assurance_defaults(
+                        &mut frame,
+                        self.effective_finalization_reserve(),
+                    );
+                    validate_assurance_task_frame(&frame, self.effective_finalization_reserve())?;
+                    if self.max_independent_review_enabled {
+                        validate_max_assurance_task_frame(&frame)?;
+                    }
                 }
             }
-            if frame.acknowledgement.trim().is_empty() {
-                frame.acknowledgement = previous.acknowledgement.clone();
-            }
-            if self.task_assurance_enabled {
-                preserve_assurance_boundaries(&mut frame, previous);
-            }
-        } else {
-            validate_initial_task_frame(&frame)?;
-            if self.task_assurance_enabled {
-                apply_runtime_assurance_defaults(&mut frame, self.effective_finalization_reserve());
-                validate_assurance_task_frame(&frame, self.effective_finalization_reserve())?;
-                if self.max_independent_review_enabled {
-                    validate_max_assurance_task_frame(&frame)?;
-                }
-            }
-        }
+            Ok(frame)
+        })();
+        self.record_control_invocation(ControlInvocationRecord {
+            stage: "planning",
+            gate: "planning",
+            revision_round,
+            format_attempt,
+            system_prompt: request_system_prompt,
+            user_message: active_goal.to_string(),
+            raw_output: raw,
+            outcome: if parsed.is_ok() {
+                "parsed"
+            } else {
+                "invalid_format"
+            },
+            error: parsed.as_ref().err().map(ToString::to_string),
+            usage,
+        });
+        let frame = parsed?;
         Ok((frame, prompt_cache_events))
     }
 
@@ -737,6 +820,7 @@ where
     ) -> Result<(IndependentReview, Vec<PromptCacheEvent>), RuntimeError> {
         let IndependentReviewInput {
             gate,
+            revision_round,
             authoritative_goal,
             presentation_context,
             task_frame,
@@ -777,15 +861,47 @@ where
                 allow_tools: false,
                 timeout: None,
             };
-            let events = self.api_client.stream(request).map_err(|error| {
-                RuntimeError::new(format!("max independent {gate} review failed: {error}"))
-            })?;
-            let (message, usage, cache_events) =
-                build_assistant_message(events).map_err(|error| {
-                    RuntimeError::new(format!(
+            let request_system_prompt = request.system_prompt.clone();
+            let events = match self.api_client.stream(request) {
+                Ok(events) => events,
+                Err(error) => {
+                    let error = format!("max independent {gate} review failed: {error}");
+                    self.record_control_invocation(ControlInvocationRecord {
+                        stage: "independent_review",
+                        gate,
+                        revision_round,
+                        format_attempt,
+                        system_prompt: request_system_prompt,
+                        user_message: artifact.clone(),
+                        raw_output: String::new(),
+                        outcome: "provider_error",
+                        error: Some(error.clone()),
+                        usage: None,
+                    });
+                    return Err(RuntimeError::new(error));
+                }
+            };
+            let (message, usage, cache_events) = match build_assistant_message(events) {
+                Ok(result) => result,
+                Err(error) => {
+                    let error = format!(
                         "max independent {gate} review returned no usable response: {error}"
-                    ))
-                })?;
+                    );
+                    self.record_control_invocation(ControlInvocationRecord {
+                        stage: "independent_review",
+                        gate,
+                        revision_round,
+                        format_attempt,
+                        system_prompt: request_system_prompt,
+                        user_message: artifact.clone(),
+                        raw_output: String::new(),
+                        outcome: "response_error",
+                        error: Some(error.clone()),
+                        usage: None,
+                    });
+                    return Err(RuntimeError::new(error));
+                }
+            };
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }
@@ -799,10 +915,27 @@ where
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            match parse_independent_review(&raw).and_then(|review| {
+            let parsed = parse_independent_review(&raw).and_then(|review| {
                 validate_independent_review(&review)?;
                 Ok(review)
-            }) {
+            });
+            self.record_control_invocation(ControlInvocationRecord {
+                stage: "independent_review",
+                gate,
+                revision_round,
+                format_attempt,
+                system_prompt: request_system_prompt,
+                user_message: artifact.clone(),
+                raw_output: raw,
+                outcome: if parsed.is_ok() {
+                    "parsed"
+                } else {
+                    "invalid_format"
+                },
+                error: parsed.as_ref().err().cloned(),
+                usage,
+            });
+            match parsed {
                 Ok(review) => return Ok((review, prompt_cache_events)),
                 Err(error) => last_error = Some(error),
             }
@@ -816,6 +949,52 @@ where
     fn effective_finalization_reserve(&self) -> usize {
         self.finalization_reserve
             .min(self.max_iterations.saturating_sub(1))
+    }
+
+    fn record_control_invocation(&mut self, record: ControlInvocationRecord<'_>) {
+        self.pending_control_events
+            .push(RuntimeStreamEvent::ControlInvocation {
+                stage: record.stage.to_string(),
+                gate: record.gate.to_string(),
+                revision_round: record.revision_round,
+                format_attempt: record.format_attempt,
+                system_prompt: record.system_prompt,
+                user_message: record.user_message,
+                raw_output: record.raw_output,
+                outcome: record.outcome.to_string(),
+                error: record.error,
+                usage: record.usage,
+            });
+    }
+
+    fn record_control_fallback(
+        &mut self,
+        stage: &str,
+        gate: &str,
+        revision_round: usize,
+        error: &str,
+    ) {
+        self.record_control_invocation(ControlInvocationRecord {
+            stage,
+            gate,
+            revision_round,
+            format_attempt: 0,
+            system_prompt: Vec::new(),
+            user_message: String::new(),
+            raw_output: String::new(),
+            outcome: "fallback",
+            error: Some(error.to_string()),
+            usage: None,
+        });
+    }
+
+    fn emit_pending_control_events(&mut self, observer: Option<&mut RuntimeStreamObserver<'_>>) {
+        let pending = std::mem::take(&mut self.pending_control_events);
+        if let Some(observer) = observer {
+            for event in pending {
+                observer(event);
+            }
+        }
     }
 
     /// Run a session health probe to verify the runtime is functional after compaction.
@@ -908,6 +1087,8 @@ where
                 presentation_context.as_deref(),
                 None,
                 None,
+                0,
+                1,
             );
             for format_attempt in 2..=checkpoint_attempts {
                 let Err(previous_error) = &checkpoint else {
@@ -921,12 +1102,15 @@ where
                     presentation_context.as_deref(),
                     None,
                     Some(&recovery_reason),
+                    0,
+                    format_attempt,
                 );
             }
             let (mut frame, checkpoint_cache_events) = match checkpoint {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => {
                     if self.max_independent_review_enabled {
+                        self.record_control_fallback("planning", "planning", 0, &error.to_string());
                         max_review_feedback_due = Some(format!(
                             "MAX PLANNING CHECKPOINT RECOVERY: Structured planning did not converge after {checkpoint_attempts} attempts ({error}). Continue the user's task using the authoritative request and normal authorization controls. Build a practical plan internally, perform useful work, and disclose any uncertainty in your own final answer."
                         ));
@@ -944,6 +1128,7 @@ where
                     }
                 }
             };
+            self.emit_pending_control_events(observer.as_deref_mut());
             prompt_cache_events.extend(checkpoint_cache_events);
             // The independent max planning review can require several slow model
             // round trips. Publish the already validated acknowledgement before
@@ -961,6 +1146,7 @@ where
                     let (review, review_cache_events) =
                         match self.run_independent_review(IndependentReviewInput {
                             gate: "planning",
+                            revision_round,
                             authoritative_goal: &authoritative_goal,
                             presentation_context: presentation_context.as_deref(),
                             task_frame: &frame,
@@ -970,9 +1156,16 @@ where
                         }) {
                             Ok(result) => result,
                             Err(error) => {
+                                self.record_control_fallback(
+                                    "independent_review",
+                                    "planning",
+                                    revision_round,
+                                    &error.to_string(),
+                                );
                                 (failed_independent_review("planning", &error), Vec::new())
                             }
                         };
+                    self.emit_pending_control_events(observer.as_deref_mut());
                     prompt_cache_events.extend(review_cache_events);
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::IndependentReview {
@@ -1015,6 +1208,8 @@ where
                                 presentation_context.as_deref(),
                                 Some(&frame),
                                 Some(&reason),
+                                revision_round,
+                                1,
                             );
                             for format_attempt in 2..=MAX_TASK_FRAME_FORMAT_ATTEMPTS {
                                 let Err(previous_error) = &revised_checkpoint else {
@@ -1028,8 +1223,11 @@ where
                                     presentation_context.as_deref(),
                                     Some(&frame),
                                     Some(&recovery_reason),
+                                    revision_round,
+                                    format_attempt,
                                 );
                             }
+                            self.emit_pending_control_events(observer.as_deref_mut());
                             match revised_checkpoint {
                                 Ok((revised, replan_cache_events)) => {
                                     prompt_cache_events.extend(replan_cache_events);
@@ -1039,6 +1237,13 @@ where
                                     let failure = RuntimeError::new(format!(
                                         "max planning revision could not produce a valid task frame after {MAX_TASK_FRAME_FORMAT_ATTEMPTS} format attempts: {error}"
                                     ));
+                                    self.record_control_fallback(
+                                        "planning",
+                                        "planning",
+                                        revision_round,
+                                        &failure.to_string(),
+                                    );
+                                    self.emit_pending_control_events(observer.as_deref_mut());
                                     let failed_review =
                                         failed_independent_review("planning", &failure);
                                     if let Some(observer) = observer.as_deref_mut() {
@@ -1126,7 +1331,10 @@ where
                     presentation_context.as_deref(),
                     task_frame.as_ref(),
                     assurance_review_due.as_deref(),
+                    0,
+                    1,
                 );
+                self.emit_pending_control_events(observer.as_deref_mut());
                 let (frame, checkpoint_cache_events) = match checkpoint {
                     Ok(checkpoint) => checkpoint,
                     Err(error) => {
@@ -1142,10 +1350,12 @@ where
                         let failure = format!(
                             "Task replan unavailable; preserved the confirmed task frame: {error}"
                         );
+                        self.record_control_fallback("planning", "planning", 0, &failure);
                         preserved.failures.push(failure);
                         (preserved, Vec::new())
                     }
                 };
+                self.emit_pending_control_events(observer.as_deref_mut());
                 prompt_cache_events.extend(checkpoint_cache_events);
                 let phase = if finalization_reserve_started
                     && assurance_review_due
@@ -1321,6 +1531,7 @@ where
                     let (review, review_cache_events) =
                         match self.run_independent_review(IndependentReviewInput {
                             gate: "execution_evidence",
+                            revision_round: max_execution_revision_round,
                             authoritative_goal: &authoritative_goal,
                             presentation_context: presentation_context.as_deref(),
                             task_frame: frame,
@@ -1329,11 +1540,20 @@ where
                             proposed_answer: Some(&assistant_message),
                         }) {
                             Ok(result) => result,
-                            Err(error) => (
-                                failed_independent_review("execution_evidence", &error),
-                                Vec::new(),
-                            ),
+                            Err(error) => {
+                                self.record_control_fallback(
+                                    "independent_review",
+                                    "execution_evidence",
+                                    max_execution_revision_round,
+                                    &error.to_string(),
+                                );
+                                (
+                                    failed_independent_review("execution_evidence", &error),
+                                    Vec::new(),
+                                )
+                            }
                         };
+                    self.emit_pending_control_events(observer.as_deref_mut());
                     prompt_cache_events.extend(review_cache_events);
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::IndependentReview {
@@ -1372,6 +1592,7 @@ where
                     let (review, review_cache_events) =
                         match self.run_independent_review(IndependentReviewInput {
                             gate: "final_claim",
+                            revision_round: max_final_claim_revision_round,
                             authoritative_goal: &authoritative_goal,
                             presentation_context: presentation_context.as_deref(),
                             task_frame: frame,
@@ -1381,9 +1602,16 @@ where
                         }) {
                             Ok(result) => result,
                             Err(error) => {
+                                self.record_control_fallback(
+                                    "independent_review",
+                                    "final_claim",
+                                    max_final_claim_revision_round,
+                                    &error.to_string(),
+                                );
                                 (failed_independent_review("final_claim", &error), Vec::new())
                             }
                         };
+                    self.emit_pending_control_events(observer.as_deref_mut());
                     prompt_cache_events.extend(review_cache_events);
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::IndependentReview {
@@ -4158,6 +4386,11 @@ mod tests {
                     };
                     return Ok(vec![
                         AssistantEvent::TextDelta(response.to_string()),
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 11,
+                            output_tokens: 7,
+                            ..TokenUsage::default()
+                        }),
                         AssistantEvent::MessageStop,
                     ]);
                 }
@@ -4294,6 +4527,61 @@ mod tests {
                 .count(),
             6
         );
+        let control_events = observed
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeStreamEvent::ControlInvocation {
+                    stage,
+                    gate,
+                    revision_round,
+                    format_attempt,
+                    system_prompt,
+                    user_message,
+                    raw_output,
+                    outcome,
+                    usage,
+                    ..
+                } => Some((
+                    stage,
+                    gate,
+                    revision_round,
+                    format_attempt,
+                    system_prompt,
+                    user_message,
+                    raw_output,
+                    outcome,
+                    usage,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(control_events.len(), 10);
+        assert!(control_events.iter().any(
+            |(
+                stage,
+                gate,
+                revision_round,
+                format_attempt,
+                system_prompt,
+                user_message,
+                raw_output,
+                outcome,
+                usage,
+            )| {
+                stage.as_str() == "independent_review"
+                    && gate.as_str() == "final_claim"
+                    && **revision_round == 1
+                    && **format_attempt == 1
+                    && system_prompt
+                        .iter()
+                        .any(|part| part.contains("FINAL CLAIM GATE"))
+                    && user_message.contains("RAW TOOL RESULT LEDGER")
+                    && raw_output.contains("final claim now matches")
+                    && outcome.as_str() == "parsed"
+                    && usage
+                        .is_some_and(|usage| usage.input_tokens == 11 && usage.output_tokens == 7)
+            }
+        ));
     }
 
     #[test]
@@ -4627,8 +4915,10 @@ mod tests {
         .with_task_assurance(true, 4)
         .with_max_independent_review(true);
 
+        let mut observed = Vec::new();
+        let mut observer = |event| observed.push(event);
         let summary = runtime
-            .run_turn("inspect state", None)
+            .run_turn_observed("inspect state", None, Some(&mut observer))
             .expect("invalid critic output should degrade to agent-owned finalization");
 
         assert_eq!(runtime.api_client_mut().review_calls, 15);
@@ -4640,6 +4930,20 @@ mod tests {
             super::user_visible_text(summary.assistant_messages.last().expect("agent answer")),
             "I inspected the available state and am reporting it with uncertainty."
         );
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::ControlInvocation {
+                stage,
+                gate,
+                format_attempt: 0,
+                outcome,
+                error: Some(error),
+                ..
+            } if stage == "independent_review"
+                && gate == "planning"
+                && outcome == "fallback"
+                && error.contains("invalid verdict after 3 format attempts")
+        )));
     }
 
     #[test]
