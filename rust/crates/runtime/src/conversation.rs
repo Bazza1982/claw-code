@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -36,6 +36,7 @@ const PRESENTATION_CONTEXT_PROMPT: &str = "VISIBLE PRESENTATION CONTRACT: The co
 const TASK_REPLANNING_PROMPT: &str = r#"TASK CONTROL REPLAN. Return one JSON object only, without markdown fences or tool calls, using the same task-frame schema supplied below. Re-plan the remaining work from verified progress and failures. You may change strategy and tools, but you must not change the active goal, expand authorization, or turn historical evidence into a new task. Keep it concise."#;
 const TASK_ASSURANCE_PLANNING_PROMPT: &str = r#"HIGH-EFFORT ASSURANCE PLAN. Extend the task-frame JSON with this object: "assurance":{"review_strategy":["planned gate timing and purpose"],"review_interval_tool_results":6,"review_triggers":["risk events requiring an extra gate"],"validation_strategy":["task-matched evidence and lower-cost fallback"],"finalization_reserve":6,"critical_review_findings":[],"validation_evidence":[],"unverified_items":[]}. Choose review_interval_tool_results from 1 through 24 based on task scope and risk; this controls periodic review frequency, while risk events may add gates sooner. Plan Critical Review Gates to test requirement coverage, assumptions, scope, regressions, and remaining risk. finalization_reserve is supplied by the runtime and must be preserved. Do not claim that running an unrelated command is validation."#;
 const MAX_ASSURANCE_PLANNING_PROMPT: &str = r#"MAX-EFFORT PLAN EXTENSION. The assurance object must additionally contain "test_strategy":["task-matched behavioral, regression, negative-path, or invariant tests; state explicitly when no test applies"], "testing_evidence":[], and "claim_evidence":[]. Distinguish verification (evidence that the requested real state changed) from testing (evidence that behavior and regressions are acceptable). Design both before execution. claim_evidence must later contain concise claim-to-raw-evidence mappings; agent assertions and generated status files are not raw evidence."#;
+const MAX_PLUS_ASSURANCE_PLANNING_PROMPT: &str = r#"EXPERIMENTAL MAX+ PLAN EXTENSION. Preserve all MAX-EFFORT fields and additionally maintain "hypotheses":[{"id":"H1","statement":"a falsifiable explanation or proposed route","status":"open|supported|weakened|rejected","evidence_refs":[]}], "discriminations":[{"hypothesis_ids":["H1"],"question":"what uncertainty this separates","method":"the lowest-cost decisive check","expected_information_gain":"high|medium|low","risk_reduction":"high|medium|low","status":"planned|running|complete|skipped","evidence_refs":[]}], and "evidence_updates":[{"hypothesis_id":"H1","effect":"supports|weakens|rejects|inconclusive","evidence_ref":"raw result reference","rationale":"why the evidence changes belief"}]. Use competing hypotheses when uncertainty is material. Prefer the next discrimination that most reduces decision risk per unit cost. Do not add another exploration round when expected information gain is low, remaining uncertainty cannot change the action, or the finalization reserve has started. Never manufacture hypotheses for a straightforward task; an empty list is valid when there is no material uncertainty."#;
 const CRITICAL_REVIEW_PROMPT: &str = r#"CRITICAL REVIEW GATE. Before continuing, critically compare verified evidence with the active goal and success criteria. Look for omissions, invalid assumptions, scope creep, unauthorized changes, regressions, and counterexamples. Update critical_review_findings, validation_evidence, unverified_items, completed, remaining_work, failures, and next_action. Preserve the review and validation strategies unless evidence justifies changing the strategy. This is an evidence review, not a request for self-congratulation."#;
 const FINALIZATION_RESERVE_PROMPT: &str = r#"FINALIZATION RESERVE HAS STARTED. Stop optional exploration and feature expansion. First complete the Critical Review, then use the remaining tool-enabled iterations only for the highest-value validation still needed, then produce the user-visible summary from the resulting evidence. A failed, blocked, skipped, or irrelevant validation must be reported as unverified or incomplete and must never be summarized as success."#;
 const MAX_INDEPENDENT_REVIEW_PROMPT: &str = r#"MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR. You are a fresh, adversarial reviewer, not the task-performing agent. Judge only the supplied task artifacts and raw evidence. Do not continue the task, call tools, rewrite the answer, or trust agent-authored status fields when raw tool evidence conflicts with them. Look for correlated reasoning errors, missing counterexamples, invalid verification design, tests that do not prove the requested behavior, failed or skipped checks presented as success, scope or authorization drift, and claims stronger than the evidence. Return one JSON object only, without markdown fences, using this schema:
@@ -43,6 +44,9 @@ const MAX_INDEPENDENT_REVIEW_PROMPT: &str = r#"MAX-EFFORT INDEPENDENT CRITICAL E
 PASS requires concrete evidence_refs and no unresolved critical/high finding or required change. REVISE requires an actionable finding or required change. BLOCK is reserved for an authorization boundary, irrecoverable contradiction, or exhausted safe route. When evidence is missing, truncated, ambiguous, or only asserted by the agent, do not infer success."#;
 const MAX_REVIEW_REVISION_PROMPT: &str = "MAX REVIEW FEEDBACK. An independent evaluator identified concerns in the previous plan or proposed completion. Use the feedback to improve the work within the active task scope. The evaluator is advisory: it does not own execution and must not replace the task-performing agent's final answer. Address supported concerns using raw evidence, but reject irrelevant or disproportionate advice. Use tools when necessary and allowed. Never convert missing or failed evidence into a success claim. If evidence cannot be obtained, report the affected item as unverified or incomplete.";
 const MAX_REVIEW_MAX_REVISIONS: usize = 3;
+const MAX_PLUS_REVIEW_MAX_REVISIONS: usize = 5;
+const DEFAULT_MAX_PLUS_TOKEN_BUDGET: u32 = 1_500_000;
+const DEFAULT_MAX_PLUS_TIME_BUDGET: Duration = Duration::from_secs(1_500);
 const MAX_TASK_FRAME_FORMAT_ATTEMPTS: usize = 3;
 const MAX_INDEPENDENT_REVIEW_FORMAT_ATTEMPTS: usize = 3;
 const MAX_REVIEW_EVIDENCE_CHARS: usize = 120_000;
@@ -105,6 +109,79 @@ pub struct TaskAssurance {
     pub claim_evidence: Vec<String>,
     #[serde(default)]
     pub unverified_items: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hypotheses: Vec<MaxPlusHypothesis>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discriminations: Vec<MaxPlusDiscrimination>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_updates: Vec<MaxPlusEvidenceUpdate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaxPlusHypothesis {
+    pub id: String,
+    pub statement: String,
+    pub status: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaxPlusDiscrimination {
+    #[serde(default)]
+    pub hypothesis_ids: Vec<String>,
+    pub question: String,
+    pub method: String,
+    pub expected_information_gain: String,
+    pub risk_reduction: String,
+    pub status: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaxPlusEvidenceUpdate {
+    pub hypothesis_id: String,
+    pub effect: String,
+    pub evidence_ref: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxPlusPhase {
+    Planning,
+    Discrimination,
+    EvidenceUpdate,
+    VerificationReview,
+    TestingReview,
+    CompletionReview,
+    Finalizing,
+    Completed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxPlusStopReason {
+    GoalSatisfied,
+    BudgetExhausted,
+    LowInformationGain,
+    RiskCannotBeReduced,
+    AuthorizationBlocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaxPlusBudgetSnapshot {
+    pub tool_iterations_used: usize,
+    pub tool_iterations_limit: usize,
+    pub review_revisions_used: usize,
+    pub review_revisions_limit: usize,
+    pub finalization_reserve: usize,
+    pub tokens_used: u32,
+    pub token_limit: u32,
+    pub elapsed_seconds: u64,
+    pub time_limit_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +347,12 @@ pub enum RuntimeStreamEvent {
         revision_round: usize,
         review: IndependentReview,
     },
+    MaxPlusCheckpoint {
+        phase: MaxPlusPhase,
+        budget: MaxPlusBudgetSnapshot,
+        stop_reason: Option<MaxPlusStopReason>,
+        frame: TaskFrame,
+    },
     ControlInvocation {
         stage: String,
         gate: String,
@@ -418,6 +501,7 @@ impl CompletionStatus {
 pub enum TurnStopReason {
     EndTurn,
     IndependentReview,
+    BudgetExhausted,
     MaxIterations,
     NoFinalText,
 }
@@ -428,6 +512,7 @@ impl TurnStopReason {
         match self {
             Self::EndTurn => "end_turn",
             Self::IndependentReview => "independent_review",
+            Self::BudgetExhausted => "budget_exhausted",
             Self::MaxIterations => "max_iterations",
             Self::NoFinalText => "no_final_text",
         }
@@ -457,6 +542,9 @@ pub struct ConversationRuntime<C, T> {
     task_planning_enabled: bool,
     task_assurance_enabled: bool,
     max_independent_review_enabled: bool,
+    max_plus_enabled: bool,
+    max_plus_token_budget: u32,
+    max_plus_time_budget: Duration,
     finalization_reserve: usize,
     pending_control_events: Vec<RuntimeStreamEvent>,
 }
@@ -511,6 +599,9 @@ where
             task_planning_enabled: false,
             task_assurance_enabled: false,
             max_independent_review_enabled: false,
+            max_plus_enabled: false,
+            max_plus_token_budget: DEFAULT_MAX_PLUS_TOKEN_BUDGET,
+            max_plus_time_budget: DEFAULT_MAX_PLUS_TIME_BUDGET,
             finalization_reserve: 0,
             pending_control_events: Vec::new(),
         }
@@ -545,6 +636,25 @@ where
         if enabled {
             self.task_planning_enabled = true;
         }
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_plus(mut self, enabled: bool) -> Self {
+        self.max_plus_enabled = enabled;
+        if enabled {
+            self.task_planning_enabled = true;
+            self.task_assurance_enabled = true;
+            self.max_independent_review_enabled = true;
+            self.finalization_reserve = self.finalization_reserve.max(16);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_plus_budgets(mut self, token_budget: u32, time_budget: Duration) -> Self {
+        self.max_plus_token_budget = token_budget.max(1);
+        self.max_plus_time_budget = time_budget.max(Duration::from_secs(1));
         self
     }
 
@@ -674,6 +784,9 @@ where
             if self.max_independent_review_enabled {
                 system_prompt.push(MAX_ASSURANCE_PLANNING_PROMPT.to_string());
             }
+            if self.max_plus_enabled {
+                system_prompt.push(MAX_PLUS_ASSURANCE_PLANNING_PROMPT.to_string());
+            }
             system_prompt.push(format!(
                 "RUNTIME FINALIZATION RESERVE: {} iterations. Use this exact value in finalization_reserve.",
                 self.effective_finalization_reserve()
@@ -790,6 +903,9 @@ where
                     if self.max_independent_review_enabled {
                         validate_max_assurance_task_frame(&frame)?;
                     }
+                    if self.max_plus_enabled {
+                        validate_max_plus_assurance_task_frame(&frame)?;
+                    }
                 }
             }
             Ok(frame)
@@ -840,7 +956,10 @@ where
         let gate_instruction = match gate {
             "planning" => "PLANNING GATE: Critique the plan before any task tools run. Test requirement coverage, authorization boundaries, assumptions, verification design, test design, failure criteria, and whether the proposed evidence could actually prove success. At this gate, task-tool evidence is absent by construction. Do not require actual-state, preflight, version, health, test, registry, or other tool-derived evidence as a condition for allowing the tools that would collect it. Treat explicitly planned future evidence collection as remaining work, not as a missing-evidence defect, when the plan names task-matched sources, pass/fail criteria, safety stop conditions, and what must remain unverified if collection fails. Do not require an additional independent observer: the later execution-evidence and final-claim gates provide independent review after tools run. REVISE when the evidence design or safety gates are inadequate; BLOCK only for the reserved authorization, contradiction, or exhausted-safe-route conditions, not merely because planned evidence does not exist yet.",
             "execution_evidence" => "EXECUTION EVIDENCE GATE: Critique the actual verification and testing execution after task activity. Raw tool calls and results outrank the task frame, generated files, and the agent's proposed answer. Audit every tool name and input against the authoritative goal and do_not_do boundaries, including read-only exploration outside an explicitly named target. Check each success criterion and identify unauthorized, failed, skipped, ambiguous, truncated, irrelevant, or non-author-specific evidence.",
+            "verification" => "MAX+ VERIFICATION VERDICT: Judge only whether raw evidence proves the requested real-world or repository state changed as claimed. Audit authorization and scope, requirement coverage, direct observations, negative evidence, ambiguity, truncation, and whether each success criterion has a task-matched evidence reference. Do not pass merely because tests succeeded.",
+            "testing" => "MAX+ TESTING VERDICT: Judge only whether behavioral, regression, negative-path, and invariant testing is sufficient for the task and risk. Distinguish tests from verification of actual state. Identify failed, skipped, flaky, irrelevant, over-mocked, or missing tests, and require explicit justification when no test applies.",
             "final_claim" => "FINAL CLAIM GATE: Audit every material completion claim in the proposed user-visible answer against raw evidence. Reject stronger-than-evidence wording, hidden failures, date or count contradictions, fallback presented as primary-path success, and unverified state recorded as verified. Also audit the proposed answer against every USER-VISIBLE PRESENTATION CONTRACT constraint, including required language, persona or form of address, visibility requirements, and local path formatting. REVISE any answer that exposes a forbidden path form or otherwise violates that contract even when its factual claims are correct.",
+            "completion" => "MAX+ COMPLETION VERDICT: Independently audit every material claim in the proposed final answer against the already reviewed verification and testing evidence. Reject stronger-than-evidence wording, hidden failures, unresolved high-risk uncertainty, budget or stop-condition violations, and presentation-contract violations. This verdict cannot repair missing verification or testing by assertion.",
             _ => "Critically evaluate the supplied task artifacts and raw evidence.",
         };
         let mut prompt_cache_events = Vec::new();
@@ -951,6 +1070,34 @@ where
             .min(self.max_iterations.saturating_sub(1))
     }
 
+    fn effective_review_revision_limit(&self) -> usize {
+        if self.max_plus_enabled {
+            MAX_PLUS_REVIEW_MAX_REVISIONS
+        } else {
+            MAX_REVIEW_MAX_REVISIONS
+        }
+    }
+
+    fn max_plus_budget_snapshot(
+        &self,
+        tool_iterations_used: usize,
+        review_revisions_used: usize,
+        tokens_used: u32,
+        elapsed: Duration,
+    ) -> MaxPlusBudgetSnapshot {
+        MaxPlusBudgetSnapshot {
+            tool_iterations_used,
+            tool_iterations_limit: self.max_iterations,
+            review_revisions_used,
+            review_revisions_limit: self.effective_review_revision_limit(),
+            finalization_reserve: self.effective_finalization_reserve(),
+            tokens_used,
+            token_limit: self.max_plus_token_budget,
+            elapsed_seconds: elapsed.as_secs(),
+            time_limit_seconds: self.max_plus_time_budget.as_secs(),
+        }
+    }
+
     fn record_control_invocation(&mut self, record: ControlInvocationRecord<'_>) {
         self.pending_control_events
             .push(RuntimeStreamEvent::ControlInvocation {
@@ -1032,6 +1179,8 @@ where
         mut observer: Option<&mut RuntimeStreamObserver<'_>>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
+        let max_plus_started_at = Instant::now();
+        let max_plus_start_tokens = self.usage_tracker.cumulative_usage().total_tokens();
         let authoritative_goal = authoritative_current_request(&user_input);
         let presentation_context = bridge_presentation_context(&user_input);
 
@@ -1072,8 +1221,10 @@ where
         let mut max_review_feedback_due: Option<String> = None;
         let mut max_execution_reviewed_tool_count: Option<usize> = None;
         let mut max_execution_revision_round = 0;
+        let mut max_testing_revision_round = 0;
         let mut max_final_claim_revision_round = 0;
         let mut max_agent_owned_finalization_due = false;
+        let mut max_plus_budget_exhausted = false;
         let mut task_frame = if self.task_planning_enabled {
             let checkpoint_attempts = if self.max_independent_review_enabled {
                 MAX_TASK_FRAME_FORMAT_ATTEMPTS
@@ -1189,7 +1340,7 @@ where
                             break;
                         }
                         IndependentReviewDecision::Revise => {
-                            if revision_round >= MAX_REVIEW_MAX_REVISIONS {
+                            if revision_round >= self.effective_review_revision_limit() {
                                 max_review_feedback_due =
                                     Some(independent_review_feedback("planning", &review));
                                 self.record_task_plan("planning_review_advisory", &frame);
@@ -1277,6 +1428,22 @@ where
                     phase: "initial".to_string(),
                     frame: frame.clone(),
                 });
+                if self.max_plus_enabled {
+                    observer(RuntimeStreamEvent::MaxPlusCheckpoint {
+                        phase: MaxPlusPhase::Planning,
+                        budget: self.max_plus_budget_snapshot(
+                            0,
+                            0,
+                            self.usage_tracker
+                                .cumulative_usage()
+                                .total_tokens()
+                                .saturating_sub(max_plus_start_tokens),
+                            max_plus_started_at.elapsed(),
+                        ),
+                        stop_reason: None,
+                        frame: frame.clone(),
+                    });
+                }
             }
             goal_reanchor_due = false;
             Some(frame)
@@ -1292,6 +1459,27 @@ where
                 let error = RuntimeError::new("conversation loop exceeded its finalization turn");
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
+            }
+
+            if self.max_plus_enabled && !max_plus_budget_exhausted {
+                let tokens_used = self
+                    .usage_tracker
+                    .cumulative_usage()
+                    .total_tokens()
+                    .saturating_sub(max_plus_start_tokens);
+                if tokens_used >= self.max_plus_token_budget
+                    || max_plus_started_at.elapsed() >= self.max_plus_time_budget
+                {
+                    max_plus_budget_exhausted = true;
+                    reached_execution_budget = true;
+                    max_agent_owned_finalization_due = true;
+                    max_review_feedback_due = Some(format!(
+                        "MAX+ BUDGET STOP: stop exploration and tool use now. Produce an evidence-bounded final answer. tokens={tokens_used}/{} elapsed_seconds={}/{}.",
+                        self.max_plus_token_budget,
+                        max_plus_started_at.elapsed().as_secs(),
+                        self.max_plus_time_budget.as_secs(),
+                    ));
+                }
             }
 
             let remaining_iterations = self.max_iterations.saturating_sub(iterations);
@@ -1374,6 +1562,41 @@ where
                         phase: phase.to_string(),
                         frame: frame.clone(),
                     });
+                    if self.max_plus_enabled {
+                        let max_plus_phase = if finalization_reserve_started {
+                            MaxPlusPhase::Finalizing
+                        } else if frame
+                            .assurance
+                            .as_deref()
+                            .is_some_and(|assurance| !assurance.evidence_updates.is_empty())
+                        {
+                            MaxPlusPhase::EvidenceUpdate
+                        } else if frame.assurance.as_deref().is_some_and(|assurance| {
+                            assurance.discriminations.iter().any(|discrimination| {
+                                matches!(discrimination.status.as_str(), "planned" | "running")
+                            })
+                        }) {
+                            MaxPlusPhase::Discrimination
+                        } else {
+                            MaxPlusPhase::Planning
+                        };
+                        observer(RuntimeStreamEvent::MaxPlusCheckpoint {
+                            phase: max_plus_phase,
+                            budget: self.max_plus_budget_snapshot(
+                                iterations,
+                                max_execution_revision_round
+                                    + max_testing_revision_round
+                                    + max_final_claim_revision_round,
+                                self.usage_tracker
+                                    .cumulative_usage()
+                                    .total_tokens()
+                                    .saturating_sub(max_plus_start_tokens),
+                                max_plus_started_at.elapsed(),
+                            ),
+                            stop_reason: None,
+                            frame: frame.clone(),
+                        });
+                    }
                 }
                 task_frame = Some(frame);
                 goal_reanchor_due = false;
@@ -1527,10 +1750,15 @@ where
                     )
                 })?;
                 let mut execution_review_unresolved = false;
+                let execution_gate = if self.max_plus_enabled {
+                    "verification"
+                } else {
+                    "execution_evidence"
+                };
                 if max_execution_reviewed_tool_count != Some(tool_results.len()) {
                     let (review, review_cache_events) =
                         match self.run_independent_review(IndependentReviewInput {
-                            gate: "execution_evidence",
+                            gate: execution_gate,
                             revision_round: max_execution_revision_round,
                             authoritative_goal: &authoritative_goal,
                             presentation_context: presentation_context.as_deref(),
@@ -1543,12 +1771,12 @@ where
                             Err(error) => {
                                 self.record_control_fallback(
                                     "independent_review",
-                                    "execution_evidence",
+                                    execution_gate,
                                     max_execution_revision_round,
                                     &error.to_string(),
                                 );
                                 (
-                                    failed_independent_review("execution_evidence", &error),
+                                    failed_independent_review(execution_gate, &error),
                                     Vec::new(),
                                 )
                             }
@@ -1557,10 +1785,26 @@ where
                     prompt_cache_events.extend(review_cache_events);
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::IndependentReview {
-                            gate: "execution_evidence".to_string(),
+                            gate: execution_gate.to_string(),
                             revision_round: max_execution_revision_round,
                             review: review.clone(),
                         });
+                        if self.max_plus_enabled {
+                            observer(RuntimeStreamEvent::MaxPlusCheckpoint {
+                                phase: MaxPlusPhase::VerificationReview,
+                                budget: self.max_plus_budget_snapshot(
+                                    iterations,
+                                    max_execution_revision_round,
+                                    self.usage_tracker
+                                        .cumulative_usage()
+                                        .total_tokens()
+                                        .saturating_sub(max_plus_start_tokens),
+                                    max_plus_started_at.elapsed(),
+                                ),
+                                stop_reason: None,
+                                frame: frame.clone(),
+                            });
+                        }
                     }
                     match review.decision {
                         IndependentReviewDecision::Pass => {
@@ -1569,16 +1813,16 @@ where
                         IndependentReviewDecision::Revise | IndependentReviewDecision::Block => {
                             execution_review_unresolved = true;
                             if !is_finalization_iteration {
-                                if max_execution_revision_round < MAX_REVIEW_MAX_REVISIONS {
+                                if max_execution_revision_round
+                                    < self.effective_review_revision_limit()
+                                {
                                     max_execution_revision_round += 1;
-                                    max_review_feedback_due = Some(independent_review_feedback(
-                                        "execution_evidence",
-                                        &review,
-                                    ));
+                                    max_review_feedback_due =
+                                        Some(independent_review_feedback(execution_gate, &review));
                                 } else {
                                     max_review_feedback_due =
                                         Some(independent_review_finalization_feedback(
-                                            "execution_evidence",
+                                            execution_gate,
                                             &review,
                                         ));
                                     max_agent_owned_finalization_due = true;
@@ -1588,10 +1832,85 @@ where
                         }
                     }
                 }
-                if !execution_review_unresolved {
+                let mut testing_review_unresolved = false;
+                if self.max_plus_enabled && !execution_review_unresolved {
                     let (review, review_cache_events) =
                         match self.run_independent_review(IndependentReviewInput {
-                            gate: "final_claim",
+                            gate: "testing",
+                            revision_round: max_testing_revision_round,
+                            authoritative_goal: &authoritative_goal,
+                            presentation_context: presentation_context.as_deref(),
+                            task_frame: frame,
+                            task_messages: &assistant_messages,
+                            tool_results: &tool_results,
+                            proposed_answer: Some(&assistant_message),
+                        }) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                self.record_control_fallback(
+                                    "independent_review",
+                                    "testing",
+                                    max_testing_revision_round,
+                                    &error.to_string(),
+                                );
+                                (failed_independent_review("testing", &error), Vec::new())
+                            }
+                        };
+                    self.emit_pending_control_events(observer.as_deref_mut());
+                    prompt_cache_events.extend(review_cache_events);
+                    if let Some(observer) = observer.as_deref_mut() {
+                        observer(RuntimeStreamEvent::IndependentReview {
+                            gate: "testing".to_string(),
+                            revision_round: max_testing_revision_round,
+                            review: review.clone(),
+                        });
+                        observer(RuntimeStreamEvent::MaxPlusCheckpoint {
+                            phase: MaxPlusPhase::TestingReview,
+                            budget: self.max_plus_budget_snapshot(
+                                iterations,
+                                max_testing_revision_round,
+                                self.usage_tracker
+                                    .cumulative_usage()
+                                    .total_tokens()
+                                    .saturating_sub(max_plus_start_tokens),
+                                max_plus_started_at.elapsed(),
+                            ),
+                            stop_reason: None,
+                            frame: frame.clone(),
+                        });
+                    }
+                    match review.decision {
+                        IndependentReviewDecision::Pass => {}
+                        IndependentReviewDecision::Revise | IndependentReviewDecision::Block => {
+                            testing_review_unresolved = true;
+                            if !is_finalization_iteration {
+                                if max_testing_revision_round
+                                    < self.effective_review_revision_limit()
+                                {
+                                    max_testing_revision_round += 1;
+                                    max_review_feedback_due =
+                                        Some(independent_review_feedback("testing", &review));
+                                } else {
+                                    max_review_feedback_due =
+                                        Some(independent_review_finalization_feedback(
+                                            "testing", &review,
+                                        ));
+                                    max_agent_owned_finalization_due = true;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if !execution_review_unresolved && !testing_review_unresolved {
+                    let completion_gate = if self.max_plus_enabled {
+                        "completion"
+                    } else {
+                        "final_claim"
+                    };
+                    let (review, review_cache_events) =
+                        match self.run_independent_review(IndependentReviewInput {
+                            gate: completion_gate,
                             revision_round: max_final_claim_revision_round,
                             authoritative_goal: &authoritative_goal,
                             presentation_context: presentation_context.as_deref(),
@@ -1604,34 +1923,55 @@ where
                             Err(error) => {
                                 self.record_control_fallback(
                                     "independent_review",
-                                    "final_claim",
+                                    completion_gate,
                                     max_final_claim_revision_round,
                                     &error.to_string(),
                                 );
-                                (failed_independent_review("final_claim", &error), Vec::new())
+                                (
+                                    failed_independent_review(completion_gate, &error),
+                                    Vec::new(),
+                                )
                             }
                         };
                     self.emit_pending_control_events(observer.as_deref_mut());
                     prompt_cache_events.extend(review_cache_events);
                     if let Some(observer) = observer.as_deref_mut() {
                         observer(RuntimeStreamEvent::IndependentReview {
-                            gate: "final_claim".to_string(),
+                            gate: completion_gate.to_string(),
                             revision_round: max_final_claim_revision_round,
                             review: review.clone(),
                         });
+                        if self.max_plus_enabled {
+                            observer(RuntimeStreamEvent::MaxPlusCheckpoint {
+                                phase: MaxPlusPhase::CompletionReview,
+                                budget: self.max_plus_budget_snapshot(
+                                    iterations,
+                                    max_final_claim_revision_round,
+                                    self.usage_tracker
+                                        .cumulative_usage()
+                                        .total_tokens()
+                                        .saturating_sub(max_plus_start_tokens),
+                                    max_plus_started_at.elapsed(),
+                                ),
+                                stop_reason: None,
+                                frame: frame.clone(),
+                            });
+                        }
                     }
                     match review.decision {
                         IndependentReviewDecision::Pass => {}
                         IndependentReviewDecision::Revise | IndependentReviewDecision::Block => {
                             if !is_finalization_iteration {
-                                if max_final_claim_revision_round < MAX_REVIEW_MAX_REVISIONS {
+                                if max_final_claim_revision_round
+                                    < self.effective_review_revision_limit()
+                                {
                                     max_final_claim_revision_round += 1;
                                     max_review_feedback_due =
-                                        Some(independent_review_feedback("final_claim", &review));
+                                        Some(independent_review_feedback(completion_gate, &review));
                                 } else {
                                     max_review_feedback_due =
                                         Some(independent_review_finalization_feedback(
-                                            "final_claim",
+                                            completion_gate,
                                             &review,
                                         ));
                                     max_agent_owned_finalization_due = true;
@@ -1898,6 +2238,8 @@ where
             },
             stop_reason: if terminal_no_final_text {
                 TurnStopReason::NoFinalText
+            } else if max_plus_budget_exhausted {
+                TurnStopReason::BudgetExhausted
             } else if reached_execution_budget {
                 TurnStopReason::MaxIterations
             } else {
@@ -1907,6 +2249,35 @@ where
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
         };
+        if self.max_plus_enabled {
+            if let (Some(observer), Some(frame)) = (observer, task_frame.as_ref()) {
+                let budget_exhausted = summary.completion_status == CompletionStatus::Incomplete;
+                observer(RuntimeStreamEvent::MaxPlusCheckpoint {
+                    phase: if budget_exhausted {
+                        MaxPlusPhase::Stopped
+                    } else {
+                        MaxPlusPhase::Completed
+                    },
+                    budget: self.max_plus_budget_snapshot(
+                        iterations,
+                        max_execution_revision_round
+                            + max_testing_revision_round
+                            + max_final_claim_revision_round,
+                        self.usage_tracker
+                            .cumulative_usage()
+                            .total_tokens()
+                            .saturating_sub(max_plus_start_tokens),
+                        max_plus_started_at.elapsed(),
+                    ),
+                    stop_reason: Some(if budget_exhausted {
+                        MaxPlusStopReason::BudgetExhausted
+                    } else {
+                        MaxPlusStopReason::GoalSatisfied
+                    }),
+                    frame: frame.clone(),
+                });
+            }
+        }
         self.record_turn_completed(&summary);
 
         Ok(summary)
@@ -2305,6 +2676,9 @@ fn fallback_max_task_frame(
             testing_evidence: Vec::new(),
             claim_evidence: Vec::new(),
             unverified_items: Vec::new(),
+            hypotheses: Vec::new(),
+            discriminations: Vec::new(),
+            evidence_updates: Vec::new(),
         })),
         completed: Vec::new(),
         remaining_work: vec!["Perform the requested work and verify the result".to_string()],
@@ -2742,6 +3116,52 @@ fn validate_max_assurance_task_frame(frame: &TaskFrame) -> Result<(), RuntimeErr
     Ok(())
 }
 
+fn validate_max_plus_assurance_task_frame(frame: &TaskFrame) -> Result<(), RuntimeError> {
+    let assurance = frame.assurance.as_deref().ok_or_else(|| {
+        RuntimeError::new(
+            "max+ task checkpoint omitted its assurance plan; execution stopped before tools",
+        )
+    })?;
+    let hypothesis_ids = assurance
+        .hypotheses
+        .iter()
+        .map(|hypothesis| hypothesis.id.trim())
+        .filter(|id| !id.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if hypothesis_ids.len() != assurance.hypotheses.len()
+        || assurance
+            .hypotheses
+            .iter()
+            .any(|hypothesis| hypothesis.statement.trim().is_empty())
+    {
+        return Err(RuntimeError::new(
+            "max+ task checkpoint contains duplicate, empty, or incomplete hypotheses",
+        ));
+    }
+    if assurance.discriminations.iter().any(|discrimination| {
+        discrimination.question.trim().is_empty()
+            || discrimination.method.trim().is_empty()
+            || discrimination
+                .hypothesis_ids
+                .iter()
+                .any(|id| !hypothesis_ids.contains(id.trim()))
+    }) {
+        return Err(RuntimeError::new(
+            "max+ task checkpoint contains an incomplete discrimination or unknown hypothesis reference",
+        ));
+    }
+    if assurance.evidence_updates.iter().any(|update| {
+        !hypothesis_ids.contains(update.hypothesis_id.trim())
+            || update.evidence_ref.trim().is_empty()
+            || update.rationale.trim().is_empty()
+    }) {
+        return Err(RuntimeError::new(
+            "max+ task checkpoint contains an incomplete evidence update or unknown hypothesis reference",
+        ));
+    }
+    Ok(())
+}
+
 fn apply_runtime_assurance_defaults(frame: &mut TaskFrame, finalization_reserve: usize) {
     let Some(assurance) = frame.assurance.as_deref_mut() else {
         return;
@@ -2797,6 +3217,15 @@ fn preserve_assurance_boundaries(frame: &mut TaskFrame, previous: &TaskFrame) {
         assurance.test_strategy = previous_assurance.test_strategy.clone();
     }
     assurance.finalization_reserve = previous_assurance.finalization_reserve;
+    if assurance.hypotheses.is_empty() && !previous_assurance.hypotheses.is_empty() {
+        assurance.hypotheses = previous_assurance.hypotheses.clone();
+    }
+    if assurance.discriminations.is_empty() && !previous_assurance.discriminations.is_empty() {
+        assurance.discriminations = previous_assurance.discriminations.clone();
+    }
+    if assurance.evidence_updates.is_empty() && !previous_assurance.evidence_updates.is_empty() {
+        assurance.evidence_updates = previous_assurance.evidence_updates.clone();
+    }
 }
 
 fn parse_semantic_compaction(raw: &str) -> Option<SemanticCompaction> {
@@ -3076,7 +3505,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
     struct ScriptedApiClient {
@@ -4582,6 +5011,171 @@ mod tests {
                         .is_some_and(|usage| usage.input_tokens == 11 && usage.output_tokens == 7)
             }
         ));
+    }
+
+    #[test]
+    fn max_plus_emits_hypothesis_checkpoint_and_three_independent_verdicts() {
+        #[derive(Default)]
+        struct MaxPlusApi {
+            gates: Vec<String>,
+        }
+
+        impl ApiClient for MaxPlusApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let prompts = request.system_prompt.join("\n");
+                if prompts.contains("MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR") {
+                    let gate = if prompts.contains("PLANNING GATE") {
+                        "planning"
+                    } else if prompts.contains("MAX+ VERIFICATION VERDICT") {
+                        "verification"
+                    } else if prompts.contains("MAX+ TESTING VERDICT") {
+                        "testing"
+                    } else if prompts.contains("MAX+ COMPLETION VERDICT") {
+                        "completion"
+                    } else {
+                        return Err(RuntimeError::new("unexpected independent gate"));
+                    };
+                    self.gates.push(gate.to_string());
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(format!(
+                            r#"{{"decision":"pass","summary":"{gate} evidence is sufficient","findings":[],"missing_evidence":[],"required_changes":[],"evidence_refs":["raw {gate} artifact"]}}"#
+                        )),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if prompts.contains("TASK CONTROL CHECKPOINT") {
+                    assert!(prompts.contains("EXPERIMENTAL MAX+ PLAN EXTENSION"));
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(
+                            r#"{"acknowledgement":"I will test MAX+ with independently reviewed evidence.","active_goal":"exercise max plus","success_criteria":["three verdicts pass"],"planned_actions":["inspect","verify","test"],"planned_tools":[],"do_not_do":["do not overclaim"],"assurance":{"review_strategy":["review each gate"],"review_interval_tool_results":6,"review_triggers":["conflicting evidence"],"validation_strategy":["inspect raw result"],"test_strategy":["run focused regression"],"finalization_reserve":16,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[],"hypotheses":[{"id":"H1","statement":"the three gates are independent","status":"open","evidence_refs":[]}],"discriminations":[{"hypothesis_ids":["H1"],"question":"which gates execute","method":"inspect emitted gate records","expected_information_gain":"high","risk_reduction":"high","status":"planned","evidence_refs":[]}],"evidence_updates":[]},"completed":[],"remaining_work":["execute"],"failures":[],"next_action":"execute"}"#.to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("MAX+ completed with reviewed evidence.".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MaxPlusApi::default(),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(32)
+        .with_task_assurance(true, 16)
+        .with_max_plus(true);
+        let mut observed = Vec::new();
+        let mut observer = |event| observed.push(event);
+
+        let summary = runtime
+            .run_turn_observed("exercise max plus", None, Some(&mut observer))
+            .expect("max+ gates should pass");
+
+        assert_eq!(summary.completion_status, CompletionStatus::Completed);
+        assert_eq!(
+            runtime.api_client_mut().gates,
+            vec!["planning", "verification", "testing", "completion"]
+        );
+        let verdict_gates = observed
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeStreamEvent::IndependentReview { gate, .. }
+                    if matches!(gate.as_str(), "verification" | "testing" | "completion") =>
+                {
+                    Some(gate.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(verdict_gates, vec!["verification", "testing", "completion"]);
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::MaxPlusCheckpoint {
+                phase: super::MaxPlusPhase::Planning,
+                frame,
+                ..
+            } if frame.assurance.as_deref().is_some_and(|assurance| assurance.hypotheses.len() == 1)
+        )));
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::MaxPlusCheckpoint {
+                phase: super::MaxPlusPhase::Completed,
+                stop_reason: Some(super::MaxPlusStopReason::GoalSatisfied),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn max_plus_token_budget_stops_tools_and_preserves_one_honest_finalization() {
+        struct BudgetApi;
+
+        impl ApiClient for BudgetApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let prompts = request.system_prompt.join("\n");
+                if prompts.contains("MAX-EFFORT INDEPENDENT CRITICAL EVALUATOR") {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(r#"{"decision":"pass","summary":"The bounded plan is safe.","findings":[],"missing_evidence":[],"required_changes":[],"evidence_refs":["task frame"]}"#.to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if prompts.contains("TASK CONTROL CHECKPOINT") {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta(r#"{"acknowledgement":"I will stop safely if the MAX+ budget is exhausted.","active_goal":"exercise token stop","success_criteria":["no tools after budget"],"planned_actions":["inspect"],"planned_tools":["echo"],"do_not_do":["do not exceed budget"],"assurance":{"review_strategy":["review before completion"],"review_interval_tool_results":6,"review_triggers":["budget stop"],"validation_strategy":["inspect raw result"],"test_strategy":["assert no tool call"],"finalization_reserve":16,"critical_review_findings":[],"validation_evidence":[],"testing_evidence":[],"claim_evidence":[],"unverified_items":[],"hypotheses":[],"discriminations":[],"evidence_updates":[]},"completed":[],"remaining_work":["inspect"],"failures":[],"next_action":"inspect"}"#.to_string()),
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 2,
+                            ..TokenUsage::default()
+                        }),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                assert!(prompts.contains("MAX+ BUDGET STOP"));
+                assert!(prompts.contains("AGENT-OWNED FINALIZATION"));
+                assert!(!request.allow_tools);
+                Ok(vec![
+                    AssistantEvent::TextDelta(
+                        "The token budget was exhausted before task tools ran; the result is unverified."
+                            .to_string(),
+                    ),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            BudgetApi,
+            StaticToolExecutor::new().register("echo", |_| Ok("must not run".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(32)
+        .with_max_plus(true)
+        .with_max_plus_budgets(1, Duration::from_secs(1_500));
+        let mut observed = Vec::new();
+        let mut observer = |event| observed.push(event);
+
+        let summary = runtime
+            .run_turn_observed("exercise token stop", None, Some(&mut observer))
+            .expect("budget stop should finalize cleanly");
+
+        assert_eq!(summary.completion_status, CompletionStatus::Incomplete);
+        assert_eq!(summary.stop_reason, TurnStopReason::BudgetExhausted);
+        assert!(summary.tool_results.is_empty());
+        assert!(observed.iter().any(|event| matches!(
+            event,
+            RuntimeStreamEvent::MaxPlusCheckpoint {
+                phase: super::MaxPlusPhase::Stopped,
+                stop_reason: Some(super::MaxPlusStopReason::BudgetExhausted),
+                budget,
+                ..
+            } if budget.tokens_used >= budget.token_limit
+        )));
     }
 
     #[test]

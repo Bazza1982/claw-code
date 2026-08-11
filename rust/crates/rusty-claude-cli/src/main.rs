@@ -7286,8 +7286,36 @@ fn cli_max_independent_review_enabled() -> bool {
         .is_some_and(|effort| max_independent_review_for_effort(&effort))
 }
 
+fn cli_max_plus_enabled() -> bool {
+    std::env::var("CLAW_EXECUTION_EFFORT")
+        .ok()
+        .is_some_and(|effort| max_plus_for_effort(&effort))
+}
+
+fn cli_max_plus_token_budget() -> u32 {
+    std::env::var("CLAW_MAX_PLUS_TOKEN_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1_500_000)
+        .clamp(100_000, 5_000_000)
+}
+
+fn cli_max_plus_time_budget() -> Duration {
+    Duration::from_secs(
+        std::env::var("CLAW_MAX_PLUS_TIME_BUDGET_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_500)
+            .clamp(60, 1_700),
+    )
+}
+
 fn max_independent_review_for_effort(effort: &str) -> bool {
     effort.trim().eq_ignore_ascii_case("max")
+}
+
+fn max_plus_for_effort(effort: &str) -> bool {
+    effort.trim().eq_ignore_ascii_case("max+")
 }
 
 fn task_assurance_for_effort(effort: &str) -> (bool, usize) {
@@ -7295,6 +7323,7 @@ fn task_assurance_for_effort(effort: &str) -> (bool, usize) {
         "high" => (true, 6),
         "xhigh" => (true, 8),
         "max" => (true, 12),
+        "max+" => (true, 16),
         _ => (false, 0),
     }
 }
@@ -12711,6 +12740,8 @@ fn build_runtime_with_plugin_state(
     .with_task_planning_enabled(cli_task_planning_enabled())
     .with_task_assurance(task_assurance_enabled, finalization_reserve)
     .with_max_independent_review(cli_max_independent_review_enabled())
+    .with_max_plus(cli_max_plus_enabled())
+    .with_max_plus_budgets(cli_max_plus_token_budget(), cli_max_plus_time_budget())
     .with_auto_compaction_input_tokens_threshold(auto_compaction_threshold);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
@@ -13563,6 +13594,19 @@ fn runtime_stream_event_json(event: RuntimeStreamEvent) -> serde_json::Value {
             "revision_round": revision_round,
             "summary": review.summary,
             "review": review,
+        }),
+        RuntimeStreamEvent::MaxPlusCheckpoint {
+            phase,
+            budget,
+            stop_reason,
+            frame,
+        } => json!({
+            "kind": "max_plus_checkpoint",
+            "phase": phase,
+            "budget": budget,
+            "stop_reason": stop_reason,
+            "frame": frame,
+            "summary": format!("MAX+ checkpoint: {phase:?}"),
         }),
         RuntimeStreamEvent::ControlInvocation {
             stage,
@@ -20157,10 +20201,13 @@ UU conflicted.rs",
         assert_eq!(crate::task_assurance_for_effort("high"), (true, 6));
         assert_eq!(crate::task_assurance_for_effort("xhigh"), (true, 8));
         assert_eq!(crate::task_assurance_for_effort("max"), (true, 12));
+        assert_eq!(crate::task_assurance_for_effort("max+"), (true, 16));
         assert!(!crate::max_independent_review_for_effort("medium"));
         assert!(!crate::max_independent_review_for_effort("high"));
         assert!(!crate::max_independent_review_for_effort("xhigh"));
         assert!(crate::max_independent_review_for_effort("MAX"));
+        assert!(!crate::max_independent_review_for_effort("max+"));
+        assert!(crate::max_plus_for_effort("MAX+"));
     }
 
     #[test]
