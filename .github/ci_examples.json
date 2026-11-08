@@ -1,0 +1,33 @@
+[
+  {
+    "paths": [
+      "README.md"
+    ],
+    "true": [
+      "docs"
+    ],
+    "false": [
+      "rust",
+      "windows"
+    ],
+    "full": false
+  },
+  {
+    "paths": [
+      "rust/crates/model/src/lib.rs"
+    ],
+    "true": [
+      "rust"
+    ],
+    "false": [
+      "windows"
+    ],
+    "full": false
+  },
+  {
+    "paths": [
+      "rust/Cargo.lock"
+    ],
+    "full": true
+  }
+]

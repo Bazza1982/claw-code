@@ -1,66 +1,99 @@
 name: Rust CI
-
-on:
+'on':
   push:
     branches:
-      - main
-      - 'gaebal/**'
-      - 'omx-issue-*'
+    - main
     paths:
-      - .github/workflows/rust-ci.yml
-      - .github/scripts/check_doc_source_of_truth.py
-      - .github/scripts/check_release_readiness.py
-      - .github/FUNDING.yml
-      - CODE_OF_CONDUCT.md
-      - CONTRIBUTING.md
-      - LICENSE
-      - README.md
-      - SECURITY.md
-      - SUPPORT.md
-      - USAGE.md
-      - PARITY.md
-      - PHILOSOPHY.md
-      - ROADMAP.md
-      - scripts/roadmap-*.sh
-      - tests/test_roadmap_helpers.py
-      - docs/**
-      - rust/**
+    - .github/workflows/rust-ci.yml
+    - .github/scripts/check_doc_source_of_truth.py
+    - .github/scripts/check_release_readiness.py
+    - .github/FUNDING.yml
+    - CODE_OF_CONDUCT.md
+    - CONTRIBUTING.md
+    - LICENSE
+    - README.md
+    - SECURITY.md
+    - SUPPORT.md
+    - USAGE.md
+    - PARITY.md
+    - PHILOSOPHY.md
+    - ROADMAP.md
+    - scripts/roadmap-*.sh
+    - tests/test_roadmap_helpers.py
+    - docs/**
+    - rust/**
+    - .github/ci_plan.py
+    - .github/test_ci_plan.py
+    - .github/ci_policy.json
+    - .github/ci_suites.json
+    - .github/ci_examples.json
   pull_request:
     branches:
-      - main
+    - main
     paths:
-      - .github/workflows/rust-ci.yml
-      - .github/scripts/check_doc_source_of_truth.py
-      - .github/scripts/check_release_readiness.py
-      - .github/FUNDING.yml
-      - CODE_OF_CONDUCT.md
-      - CONTRIBUTING.md
-      - LICENSE
-      - README.md
-      - SECURITY.md
-      - SUPPORT.md
-      - USAGE.md
-      - PARITY.md
-      - PHILOSOPHY.md
-      - ROADMAP.md
-      - scripts/roadmap-*.sh
-      - tests/test_roadmap_helpers.py
-      - docs/**
-      - rust/**
+    - .github/workflows/rust-ci.yml
+    - .github/scripts/check_doc_source_of_truth.py
+    - .github/scripts/check_release_readiness.py
+    - .github/FUNDING.yml
+    - CODE_OF_CONDUCT.md
+    - CONTRIBUTING.md
+    - LICENSE
+    - README.md
+    - SECURITY.md
+    - SUPPORT.md
+    - USAGE.md
+    - PARITY.md
+    - PHILOSOPHY.md
+    - ROADMAP.md
+    - scripts/roadmap-*.sh
+    - tests/test_roadmap_helpers.py
+    - docs/**
+    - rust/**
+    - .github/ci_plan.py
+    - .github/test_ci_plan.py
+    - .github/ci_policy.json
+    - .github/ci_suites.json
+    - .github/ci_examples.json
   workflow_dispatch:
-
+    inputs:
+      full:
+        description: Run all retained checks for a stable major/cross-domain candidate
+        type: boolean
+        required: false
+        default: true
 concurrency:
   group: rust-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
-
 defaults:
   run:
     working-directory: rust
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
+  ci-plan:
+    name: Select necessary checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs: ${{ steps.scope.outputs.docs }}
+      rust: ${{ steps.scope.outputs.rust }}
+      windows: ${{ steps.scope.outputs.windows }}
+      full: ${{ steps.scope.outputs.full }}
+      linux_os: ${{ steps.scope.outputs.linux_os }}
+      python_versions: ${{ steps.scope.outputs.python_versions }}
+      node_versions: ${{ steps.scope.outputs.node_versions }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Verify selection and failure contracts
+      run: python -B -m unittest discover -s .github -p test_ci_plan.py -q
+    - name: Select checks from actual impact
+      id: scope
+      run: python .github/ci_plan.py plan
   doc-source-of-truth:
     name: docs source-of-truth
     runs-on: ubuntu-latest
@@ -68,59 +101,75 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-      - name: Check docs and metadata for stale branding
-        run: python .github/scripts/check_doc_source_of_truth.py
-      - name: Check release policy docs and local links
-        run: python .github/scripts/check_release_readiness.py
-      - name: Check ROADMAP ids
-        run: scripts/roadmap-check-ids.sh
-      - name: Check ROADMAP helper behavior
-        run: python -m unittest discover -s tests -p test_roadmap_helpers.py
-
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v5
+      with:
+        python-version: 3.x
+    - name: Check docs and metadata for stale branding
+      run: python .github/scripts/check_doc_source_of_truth.py
+    - name: Check release policy docs and local links
+      run: python .github/scripts/check_release_readiness.py
+    - name: Check ROADMAP ids
+      run: scripts/roadmap-check-ids.sh
+    - name: Check ROADMAP helper behavior
+      run: python -m unittest discover -s tests -p test_roadmap_helpers.py
+    needs:
+    - ci-plan
+    if: ${{ needs.ci-plan.result == 'success' && needs.ci-plan.outputs.docs == 'true' }}
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust -> target
-      - name: Check formatting
-        run: cargo fmt --all --check
-
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust -> target
+    - name: Check formatting
+      run: cargo fmt --all --check
+    needs:
+    - ci-plan
+    if: ${{ needs.ci-plan.result == 'success' && needs.ci-plan.outputs.rust == 'true' }}
   test-workspace:
     name: cargo test --workspace
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust -> target
-      - name: Run workspace tests
-        run: cargo test --workspace
-
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust -> target
+    - name: Run workspace tests
+      run: cargo test --workspace
+    needs:
+    - ci-plan
+    if: ${{ needs.ci-plan.result == 'success' && needs.ci-plan.outputs.rust == 'true' }}
   clippy-workspace:
     name: cargo clippy --workspace
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust -> target
-      - name: Run workspace clippy
-        run: cargo clippy --workspace
-
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust -> target
+    - name: Run workspace clippy
+      run: cargo clippy --workspace
+    needs:
+    - ci-plan
+    if: ${{ needs.ci-plan.result == 'success' && needs.ci-plan.outputs.rust == 'true' }}
   windows-smoke:
     name: windows PowerShell smoke
     runs-on: windows-latest
@@ -129,33 +178,61 @@ jobs:
         working-directory: rust
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust -> target
-      - name: Build CLI for Windows smoke
-        run: cargo build -p rusty-claude-cli
-      - name: Smoke local commands without live credentials
-        env:
-          ANTHROPIC_API_KEY: ""
-          ANTHROPIC_AUTH_TOKEN: ""
-          OPENAI_API_KEY: ""
-          XAI_API_KEY: ""
-          DASHSCOPE_API_KEY: ""
-        run: |
-          $ErrorActionPreference = "Stop"
-          $env:CLAW_CONFIG_HOME = Join-Path $env:RUNNER_TEMP "claw config home"
-          New-Item -ItemType Directory -Force -Path $env:CLAW_CONFIG_HOME | Out-Null
-          $workspace = Join-Path $env:RUNNER_TEMP "claw path smoke"
-          New-Item -ItemType Directory -Force -Path $workspace | Out-Null
-          $claw = Join-Path $env:GITHUB_WORKSPACE "rust\target\debug\claw.exe"
-          Push-Location $workspace
-          try {
-            & $claw help
-            & $claw status
-            & $claw config env
-            & $claw doctor
-          } finally {
-            Pop-Location
-          }
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust -> target
+    - name: Build CLI for Windows smoke
+      run: cargo build -p rusty-claude-cli
+    - name: Smoke local commands without live credentials
+      env:
+        ANTHROPIC_API_KEY: ''
+        ANTHROPIC_AUTH_TOKEN: ''
+        OPENAI_API_KEY: ''
+        XAI_API_KEY: ''
+        DASHSCOPE_API_KEY: ''
+      run: |
+        $ErrorActionPreference = "Stop"
+        $env:CLAW_CONFIG_HOME = Join-Path $env:RUNNER_TEMP "claw config home"
+        New-Item -ItemType Directory -Force -Path $env:CLAW_CONFIG_HOME | Out-Null
+        $workspace = Join-Path $env:RUNNER_TEMP "claw path smoke"
+        New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+        $claw = Join-Path $env:GITHUB_WORKSPACE "rust\target\debug\claw.exe"
+        Push-Location $workspace
+        try {
+          & $claw help
+          & $claw status
+          & $claw config env
+          & $claw doctor
+        } finally {
+          Pop-Location
+        }
+    needs:
+    - ci-plan
+    if: ${{ needs.ci-plan.result == 'success' && needs.ci-plan.outputs.windows == 'true' }}
+  ci-result:
+    name: Rust CI result
+    if: ${{ always() }}
+    needs:
+    - ci-plan
+    - doc-source-of-truth
+    - fmt
+    - test-workspace
+    - clippy-workspace
+    - windows-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Require actual success of every selected check
+      env:
+        CI_NEEDS: ${{ toJSON(needs) }}
+      run: python .github/ci_plan.py summary --jobs '{"doc-source-of-truth":"docs","fmt":"rust","test-workspace":"rust","clippy-workspace":"rust","windows-smoke":"windows"}'
+permissions:
+  contents: read

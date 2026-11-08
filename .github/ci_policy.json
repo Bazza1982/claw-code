@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "global_paths": [
+    "requirements*.txt",
+    "requirements*.lock",
+    "constraints/**",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "pyproject.toml",
+    "package.json",
+    "Cargo.lock",
+    "Cargo.toml",
+    "tests/conftest.py",
+    "conftest.py",
+    "pytest.ini",
+    "tox.ini",
+    ".python-version",
+    ".node-version",
+    ".nvmrc",
+    "global.json",
+    "rust/Cargo.toml",
+    "rust/Cargo.lock",
+    "rust/rust-toolchain*"
+  ],
+  "static_paths": [
+    "*.md",
+    "docs/**",
+    "LICENSE",
+    "LICENSE.*",
+    "NOTICE",
+    "NOTICE.*",
+    ".gitignore",
+    ".editorconfig",
+    ".github/**"
+  ],
+  "groups": {
+    "docs": {
+      "paths": [],
+      "always": true
+    },
+    "rust": {
+      "paths": [
+        "rust/**"
+      ]
+    },
+    "windows": {
+      "paths": [
+        "rust/crates/rusty-claude-cli/**",
+        "rust/crates/*/src/*windows*",
+        "rust/**/windows/**",
+        "rust/Cargo.lock",
+        "rust/Cargo.toml"
+      ]
+    }
+  }
+}
